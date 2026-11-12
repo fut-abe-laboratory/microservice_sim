@@ -14,7 +14,10 @@ class Serverless(Instance):
     
     def setLastTime(self, time):
         self.last_time = time
-        
+        status_manager = self.status_manager
+        if status_manager is not None and hasattr(status_manager, "note_serverless_last_time"):
+            status_manager.note_serverless_last_time(self, time)
+
     def activateInstance(self, scaler):
         self.setuptimer = self.config.CONFIG_DEFAULT_SETUPTIME * self.config.SIM_STEP_PER_TIME + 1
         self.setStatus(Status.SETUP)

@@ -54,6 +54,9 @@ class Instance:
             self.queue.append(req)
         else:
             req.setStatus(Status.DROP)
+        status_manager = self.status_manager
+        if status_manager is not None and hasattr(status_manager, "refresh_instance_schedule"):
+            status_manager.refresh_instance_schedule(self)
         return
     
     def delRequest(self, req:Request):
@@ -70,6 +73,8 @@ class Instance:
                 status_manager.registerRunnableInstance(self)
             elif prev_status != Status.INACTIVE and status == Status.INACTIVE:
                 status_manager.removeRunnableInstance(self)
+            if hasattr(status_manager, "on_instance_status_changed"):
+                status_manager.on_instance_status_changed(self, prev_status, status)
         return
 
     def setStatusManager(self, status_manager):
@@ -92,7 +97,7 @@ class Instance:
         for i in range(num_CPU):
             if exec_queue[i] is not None:
                 req = exec_queue[i]
-                self.status = Status.WORKING
+                self.setStatus(Status.WORKING)
                 return_req = self.processRequest(req, time)
                 is_process = True
                 if return_req is not None:
@@ -105,7 +110,7 @@ class Instance:
                 req = queue.popleft()
                 exec_queue[i] = req
                 
-                self.status = Status.WORKING
+                self.setStatus(Status.WORKING)
                 return_req = self.processRequest(req, time)
                 is_process = True
                 self.incrementCpuCtr()
@@ -167,6 +172,9 @@ class Instance:
         status = self.getStatus()
         if status == Status.ACTIVE or status == Status.WORKING:
             end_reqs, is_process = self.processRequests(time)
+            status_manager = self.status_manager
+            if status_manager is not None and hasattr(status_manager, "refresh_instance_schedule"):
+                status_manager.refresh_instance_schedule(self)
             return end_reqs
         elif status == Status.SETUP:
             self.setupInstance()

@@ -1,3 +1,4 @@
+from checkpoint import discard_checkpoint
 from queue_simulator import QueueSimulator
 from config import Config
 from generator import Generator
@@ -71,7 +72,12 @@ RESULT_HEADER = [
 # Runtime settings (edit here instead of using environment variables)
 SETTINGS = {
     # CSV file containing experiment configurations.
-    "config_file": "config_list.csv",
+    # Paper suites (run twice, switching this path):
+    #   "config_list_setup30.csv"  → experiment_id 20261111_setup30_steady (container setup/shutdown 30s)
+    #   "config_list_setup1.csv"   → experiment_id 20261111_setup1_steady  (container setup/shutdown 1s)
+    # Each suite includes serverless + serverless_warm_wait (always 1s) and containers CPU=1..64.
+    # Regenerate with: python3 generate_paper_config_lists.py
+    "config_file": "config_list_setup30.csv",
     # Repeat index start (inclusive).
     "sim_count_start": 0,
     # Repeat index end (exclusive).
@@ -85,7 +91,7 @@ SETTINGS = {
     # Cores to keep free for host/background tasks.
     "reserved_cores": 4,
     # Host CPU core hint used when running on WSL.
-    "host_cores": 12,
+    "host_cores": 20,
     # Number of config rows sampled for auto-tuning benchmark.
     "autotune_configs": 4,
     # Number of repeat rounds sampled for auto-tuning benchmark.
@@ -103,16 +109,27 @@ SETTINGS = {
     # --- Steady-state detection (online batches) ---
     # When True, run until consecutive batches stabilize (or max_batches).
     "steady_enabled": True,
+    # Logical sim-time to run before the first measurement batch (transient discard).
+    "steady_warmup_time": 900,
     # Minimum completed requests per measurement batch.
     "steady_batch_reqs": 1000,
     # Minimum simulated time per batch. None => serverless timer / container heuristic.
-    "steady_batch_min_time": 600,
+    "steady_batch_min_time": 60,
     # Relative tolerance between consecutive batch means.
     "steady_rel_tol": 0.10,
+    # When max(wait) or |Δwait| is below this fraction of min(total), treat wait as stable.
+    # None => use steady_rel_tol (same scale as other relative checks).
+    "steady_wait_negligible_frac": None,
+    # Optional absolute cap on |Δwait| between batches (seconds). None => fraction rule only.
+    "steady_wait_abs_tol": None,
     # Number of consecutive stable batches required.
     "steady_consecutive": 2,
     # Safety cap on number of batches.
     "steady_max_batches": 100000,
+    # Write a resumable snapshot at least this often (wall-clock seconds).
+    # Also written when a measurement batch completes. 0 = batch boundaries only.
+    "steady_checkpoint_enabled": True,
+    "steady_checkpoint_interval_sec": 600,
     # Confidence level for batch means (normal approx).
     "steady_ci_level": 0.95,
     # Pre-extend shared request CSVs toward an estimated steady horizon (online extend still fills gaps).
@@ -137,6 +154,15 @@ def clamp_int(value, default_value, min_value=None, max_value=None):
     if max_value is not None:
         out = min(max_value, out)
     return out
+
+
+def is_steady_result_complete(result_path):
+    """True when result CSV has a row with steady_reached=True (not header-only partial)."""
+    if not os.path.isfile(result_path) or os.path.getsize(result_path) <= 0:
+        return False
+    with open(result_path, newline="") as f:
+        row = next(csv.DictReader(f), None)
+    return row is not None and row.get("steady_reached") == "True"
 
 
 def is_wsl_environment():
@@ -273,12 +299,23 @@ def apply_steady_settings(config: Config):
         config.STEADY_ENABLED = False
     else:
         config.STEADY_ENABLED = bool(SETTINGS.get("steady_enabled", False))
+    config.STEADY_WARMUP_TIME = max(
+        0.0, float(SETTINGS.get("steady_warmup_time", 0.0) or 0.0)
+    )
     config.STEADY_BATCH_REQS = clamp_int(SETTINGS.get("steady_batch_reqs"), 10000, min_value=1)
     config.STEADY_BATCH_MIN_TIME = SETTINGS.get("steady_batch_min_time")
     config.STEADY_REL_TOL = float(SETTINGS.get("steady_rel_tol", 0.05))
+    wait_frac = SETTINGS.get("steady_wait_negligible_frac")
+    config.STEADY_WAIT_NEGLIGIBLE_FRAC = float(wait_frac) if wait_frac is not None else None
+    wait_abs = SETTINGS.get("steady_wait_abs_tol")
+    config.STEADY_WAIT_ABS_TOL = float(wait_abs) if wait_abs is not None else None
     config.STEADY_CONSECUTIVE = clamp_int(SETTINGS.get("steady_consecutive"), 3, min_value=2)
     config.STEADY_MAX_BATCHES = clamp_int(SETTINGS.get("steady_max_batches"), 50, min_value=1)
     config.STEADY_CI_LEVEL = float(SETTINGS.get("steady_ci_level", 0.95))
+    config.STEADY_CHECKPOINT_ENABLED = bool(SETTINGS.get("steady_checkpoint_enabled", True))
+    config.STEADY_CHECKPOINT_INTERVAL_SEC = max(
+        0.0, float(SETTINGS.get("steady_checkpoint_interval_sec", 600.0) or 0.0)
+    )
     # Resolve default min time now that instance mode is known.
     if config.STEADY_BATCH_MIN_TIME is None:
         config.STEADY_BATCH_MIN_TIME = resolve_batch_min_time(config)
@@ -327,7 +364,8 @@ def estimate_steady_preextend_horizon(config):
         return None
     batches = resolve_preextend_batches(config)
     margin = float(SETTINGS.get("steady_preextend_margin", 1.1) or 1.1)
-    horizon = estimate_steady_batch_time(config) * batches * max(margin, 1.0)
+    warmup = float(getattr(config, "STEADY_WARMUP_TIME", 0.0) or 0.0)
+    horizon = warmup + estimate_steady_batch_time(config) * batches * max(margin, 1.0)
     lam = max(float(config.CONFIG_LAMBDA), 1e-12)
     max_rows = clamp_int(SETTINGS.get("steady_preextend_max_rows"), 2000000, min_value=1000)
     # Leave headroom vs Poisson overshoot.
@@ -509,10 +547,10 @@ def run_task_specs(task_specs, max_workers, write_summary, show_progress, output
 
     for sim_index, config_idx, row in task_specs:
         config = setup_config(row, sim_index)
-        if output_root is None and os.path.isfile(config.OUTPUT_FILE) and os.path.getsize(config.OUTPUT_FILE) > 0:
+        if output_root is None and is_steady_result_complete(config.OUTPUT_FILE):
             skipped_tasks += 1
             if show_progress:
-                print(f"[skip] repeat={sim_index} config_index={config_idx} result_exists={config.OUTPUT_FILE}")
+                print(f"[skip] repeat={sim_index} config_index={config_idx} steady_complete={config.OUTPUT_FILE}")
             continue
         pending_task_specs.append((sim_index, config_idx, row))
 
@@ -823,9 +861,10 @@ def simulate(config:Config):
 
         sim.startSimulate()
         summary = sim.endSimulate(config.CONFIG_DEFAULT_FLG)
-        sim = None
         writer.writerow(summary["result_row"])
         f.flush()
+        discard_checkpoint(sim)
+        sim = None
 
     summary["worker_elapsed_sec"] = time.time() - worker_timer
     return summary

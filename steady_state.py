@@ -118,44 +118,106 @@ class BatchAccumulator:
         }
 
 
-def metrics_stable(prev: dict, curr: dict, rel_tol: float, eps: float = 1e-12) -> bool:
-    """True if relative change is small OR 95%-style CIs overlap, for all tracked metrics."""
+def _rel_delta_ok(a: float, b: float, rel_tol: float, eps: float = 1e-12) -> bool:
+    return abs(a - b) / max(abs(b), eps) <= rel_tol
 
-    def rel_ok(a, b) -> bool:
-        return abs(a - b) / max(abs(b), eps) <= rel_tol
 
-    def ci_overlap(lo_a, hi_a, lo_b, hi_b) -> bool:
-        if any(map(lambda x: x != x, (lo_a, hi_a, lo_b, hi_b))):  # NaN check
-            return False
-        return not (hi_a < lo_b or hi_b < lo_a)
+def _ci_overlap(lo_a, hi_a, lo_b, hi_b) -> bool:
+    if any(map(lambda x: x != x, (lo_a, hi_a, lo_b, hi_b))):  # NaN check
+        return False
+    return not (hi_a < lo_b or hi_b < lo_a)
 
-    pairs = [
-        ("ex_time_total", "ci_total_low", "ci_total_high"),
-        ("ex_time_wait", "ci_wait_low", "ci_wait_high"),
-    ]
-    for mean_key, lo_key, hi_key in pairs:
-        a = float(prev[mean_key])
-        b = float(curr[mean_key])
-        if not (
-            rel_ok(a, b)
-            or ci_overlap(prev[lo_key], prev[hi_key], curr[lo_key], curr[hi_key])
-        ):
-            return False
 
-    # Instance count: relative change only (no per-request CI).
+def _mean_stable(
+    prev: dict,
+    curr: dict,
+    mean_key: str,
+    lo_key: str,
+    hi_key: str,
+    rel_tol: float,
+    eps: float = 1e-12,
+) -> bool:
+    a = float(prev[mean_key])
+    b = float(curr[mean_key])
+    return _rel_delta_ok(a, b, rel_tol, eps) or _ci_overlap(
+        prev[lo_key], prev[hi_key], curr[lo_key], curr[hi_key]
+    )
+
+
+def _wait_stable(
+    prev: dict,
+    curr: dict,
+    rel_tol: float,
+    eps: float = 1e-12,
+    wait_abs_tol: float | None = None,
+    wait_negligible_frac: float | None = None,
+) -> bool:
+    """Stability for wait time, with a negligible-wait shortcut.
+
+    When both batch means are tiny relative to sojourn time, relative error on wait
+    is dominated by noise (e.g. 1e-7 vs 1e-6 seconds). In that regime we treat wait
+    as stable if max(wait) or |Δwait| is below ``frac * min(total)``.
+    """
+    wa = float(prev["ex_time_wait"])
+    wb = float(curr["ex_time_wait"])
+    ta = float(prev["ex_time_total"])
+    tb = float(curr["ex_time_total"])
+    ref_total = max(min(abs(ta), abs(tb)), eps)
+    frac = rel_tol if wait_negligible_frac is None else float(wait_negligible_frac)
+
+    if max(wa, wb) <= frac * ref_total:
+        return True
+    if abs(wa - wb) <= frac * ref_total:
+        return True
+    if wait_abs_tol is not None and abs(wa - wb) <= float(wait_abs_tol):
+        return True
+
+    return _mean_stable(prev, curr, "ex_time_wait", "ci_wait_low", "ci_wait_high", rel_tol, eps)
+
+
+def metrics_stable(
+    prev: dict,
+    curr: dict,
+    rel_tol: float,
+    eps: float = 1e-12,
+    wait_abs_tol: float | None = None,
+    wait_negligible_frac: float | None = None,
+) -> bool:
+    """True if batch means are stable for total time, wait, and instance count."""
+    if not _mean_stable(
+        prev, curr, "ex_time_total", "ci_total_low", "ci_total_high", rel_tol, eps
+    ):
+        return False
+    if not _wait_stable(prev, curr, rel_tol, eps, wait_abs_tol, wait_negligible_frac):
+        return False
+
     ia = float(prev["ave_instances"])
     ib = float(curr["ave_instances"])
-    if not rel_ok(ia, ib):
+    if not _rel_delta_ok(ia, ib, rel_tol, eps):
         return False
     return True
 
 
-def consecutive_stable(batches: list[dict], k: int, rel_tol: float) -> bool:
+def consecutive_stable(
+    batches: list[dict],
+    k: int,
+    rel_tol: float,
+    eps: float = 1e-12,
+    wait_abs_tol: float | None = None,
+    wait_negligible_frac: float | None = None,
+) -> bool:
     if k < 2 or len(batches) < k:
         return False
     window = batches[-k:]
     for i in range(1, len(window)):
-        if not metrics_stable(window[i - 1], window[i], rel_tol):
+        if not metrics_stable(
+            window[i - 1],
+            window[i],
+            rel_tol,
+            eps,
+            wait_abs_tol=wait_abs_tol,
+            wait_negligible_frac=wait_negligible_frac,
+        ):
             return False
     return True
 

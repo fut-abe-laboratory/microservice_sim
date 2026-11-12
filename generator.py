@@ -158,8 +158,18 @@ class Generator:
             last_id = int(ids[-1])
             self.max_loaded_id = max(self.max_loaded_id, last_id)
             self.next_id = max(self.next_id, last_id + 1)
-            self.last_start_time = float(starts[-1])
+            # Use chronological max, not file-order last: shared CSVs may contain
+            # historical seams, and a stale next_arrival_time must not rewind.
+            self.last_start_time = float(np.max(starts))
+            self._invalidate_stale_next_arrival()
         return added
+
+    def _invalidate_stale_next_arrival(self):
+        """Drop next_arrival_time if it would regenerate at/before last_start_time."""
+        if self.next_arrival_time is None or self.last_start_time is None:
+            return
+        if float(self.next_arrival_time) <= float(self.last_start_time):
+            self.next_arrival_time = None
 
     def _read_rows_after(self, inputfile, after_id):
         added = []
@@ -208,6 +218,7 @@ class Generator:
         return self.calculateNextRequest(after_time, self.step_per_time)
 
     def _ensure_next_arrival_time(self):
+        self._invalidate_stale_next_arrival()
         if self.next_arrival_time is None:
             base = 0.0 if self.last_start_time is None else self.last_start_time
             self.next_arrival_time = self._sample_next_arrival(base)
@@ -257,14 +268,32 @@ class Generator:
 
     def _append_generated_until(self, path, until_time, max_new, keep_in_memory):
         """Generate and append rows with start <= until_time. Caller must hold the lock."""
+        # Re-sync clock from the on-disk tail so a stale in-memory next_arrival_time
+        # cannot rewind below rows another worker (or earlier extend) already wrote.
+        peek = self._peek_last_row(path)
+        if peek is not None:
+            last_id, last_start = peek
+            self.next_id = max(self.next_id, int(last_id) + 1)
+            self.max_loaded_id = max(self.max_loaded_id, int(last_id))
+            if self.last_start_time is None or float(last_start) > float(self.last_start_time):
+                self.last_start_time = float(last_start)
+            self._invalidate_stale_next_arrival()
+
         remaining = max_new if max_new is not None else 10**12
         created_ids = []
         created_work = []
         created_starts = []
+        min_start = None if self.last_start_time is None else float(self.last_start_time)
         while remaining > 0:
             first_t = self._ensure_next_arrival_time()
             if first_t > until_time:
                 break
+            if min_start is not None and first_t <= min_start:
+                # Should be unreachable after invalidation; force a forward sample.
+                self.next_arrival_time = None
+                first_t = self._ensure_next_arrival_time()
+                if first_t > until_time or (min_start is not None and first_t <= min_start):
+                    break
             dt = max(until_time - first_t, 0.0)
             n_est = int(self._lambda * dt * 1.25) + 64
             n_est = min(max(n_est, 1), remaining if remaining < 10**12 else n_est)
@@ -278,18 +307,23 @@ class Generator:
                 starts = np.concatenate((np.array([first_t], dtype=np.float64), rest_s))
                 workloads = np.concatenate((np.array([first_w], dtype=np.float64), rest_w))
             keep = starts <= until_time
+            if min_start is not None:
+                keep = np.logical_and(keep, starts > min_start)
             kept = int(np.count_nonzero(keep))
             if kept:
                 ids = np.arange(self.next_id, self.next_id + kept, dtype=np.int64)
+                kept_starts = starts[keep]
                 created_ids.append(ids)
                 created_work.append(workloads[keep])
-                created_starts.append(starts[keep])
+                created_starts.append(kept_starts)
                 remaining -= kept
-                self.last_start_time = float(starts[keep][-1])
+                self.last_start_time = float(kept_starts[-1])
+                min_start = self.last_start_time
                 self.next_id += kept
-            overshoot = np.where(~keep)[0]
+            overshoot = np.where(starts > until_time)[0]
             if overshoot.size:
                 self.next_arrival_time = float(starts[overshoot[0]])
+                self._invalidate_stale_next_arrival()
                 break
             self.next_arrival_time = None
             if kept == 0:
@@ -305,7 +339,8 @@ class Generator:
             return self._append_from_arrays(ids, workloads, starts)
         self.max_loaded_id = max(self.max_loaded_id, int(ids[-1]))
         self.next_id = max(self.next_id, int(ids[-1]) + 1)
-        self.last_start_time = float(starts[-1])
+        self.last_start_time = float(np.max(starts))
+        self._invalidate_stale_next_arrival()
         return []
 
     def ensure_file_until(self, path, until_time, max_new=None):

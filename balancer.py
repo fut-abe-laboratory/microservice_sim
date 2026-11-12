@@ -42,7 +42,11 @@ class Balancer:
         return
     
     def delInstance(self, instance):
-        self.instances.remove(instance)
+        try:
+            self.instances.remove(instance)
+        except ValueError:
+            # Already unregistered (e.g. duplicate idle-timeout deactivation).
+            pass
         return
     
     def getInstance(self, i: int):

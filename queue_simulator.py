@@ -22,6 +22,12 @@ from steady_state import (
 import datetime
 import os
 import math
+from checkpoint import (
+    checkpoint_path_for,
+    load_checkpoint,
+    repair_text_tail,
+    save_checkpoint,
+)
 
 class QueueSimulator:
 
@@ -67,6 +73,15 @@ class QueueSimulator:
         self.steady_z = _z_from_ci_level(float(getattr(self.config, "STEADY_CI_LEVEL", 0.95)))
         self._packet_streamed = False
         self.num_reqs = 0
+        self._resumed = False
+        self._resume_before_instances = -1
+        self._checkpoint_enabled = bool(getattr(config, "STEADY_CHECKPOINT_ENABLED", False))
+        self._checkpoint_interval_sec = float(
+            getattr(config, "STEADY_CHECKPOINT_INTERVAL_SEC", 600.0) or 0.0
+        )
+        self._last_checkpoint_wall = time.time()
+        self._num_instance_fh = None
+        self.checkpoint_path = checkpoint_path_for(config.OUTPUT_FILE)
 
         self.addCluster(Cluster(config))
         balancer = Balancer(config)
@@ -107,9 +122,22 @@ class QueueSimulator:
             self.next_request_time = time0
         
         outfile = self.config.OUTPUT_FILE_PACKET
-        with open(outfile, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(["id", "processed_by", "workload", "start", "end", "time_lifetime", "time_wait", "time_service"])
+        if self._checkpoint_enabled and os.path.isfile(self.checkpoint_path):
+            repair_text_tail(outfile)
+            repair_text_tail(self.config.OUTPUT_FILE_NUM_INSTANCE)
+            before = load_checkpoint(self)
+            self._resume_before_instances = -1 if before is None else before
+            if self._resumed:
+                print(
+                    f"[checkpoint] resumed t={self.getTime():.3f} "
+                    f"step={self.getStep()} completed={self.num_reqs} "
+                    f"batches={len(self.steady_batches)} path={self.checkpoint_path}",
+                    flush=True,
+                )
+        else:
+            with open(outfile, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(["id", "processed_by", "workload", "start", "end", "time_lifetime", "time_wait", "time_service"])
         
         return
 
@@ -147,28 +175,34 @@ class QueueSimulator:
         threshold = self.getThreshold()
         
         outfile = self.config.OUTPUT_FILE_NUM_INSTANCE
+        resumed = bool(self._resumed)
+        mode = "a" if resumed else "w"
+        needs_header = (not resumed) or (not os.path.isfile(outfile)) or os.path.getsize(outfile) == 0
         
-        with open(outfile, 'w', newline='') as f:
+        with open(outfile, mode, newline='') as f:
+            self._num_instance_fh = f
             writer = csv.writer(f)
-            writer.writerow(["sim_time", "step", "num_hot_instances"])
-        
-            before_instances = -1
+            if needs_header:
+                writer.writerow(["sim_time", "step", "num_hot_instances"])
+                f.flush()
+            try:
+                before_instances = self._resume_before_instances if resumed else -1
 
-            if self.steady_enabled:
-                self._startSimulateSteady(writer, before_instances)
-            elif limit == Limit.LIMIT_DEFAULT:
-                return
-            elif limit == Limit.LIMIT_REQUEST:
-                while(threshold > self.countReqs()):
-                    before_instances = self.simulateStepWrapper(writer, before_instances)
-            elif limit == Limit.LIMIT_TIMESTEP:
-                while(threshold > self.getStep() or self.countReqs() < self.sender.countReqs()):
-                    before_instances = self.simulateStepWrapper(writer, before_instances)
-            elif limit == Limit.LIMIT_TIME:
-                while(threshold > self.getTime() or self.countReqs() < self.sender.countReqs()):
-                    before_instances = self.simulateStepWrapper(writer, before_instances)
-            else:
-                return
+                if self.steady_enabled:
+                    self._startSimulateSteady(writer, before_instances)
+                elif limit == Limit.LIMIT_DEFAULT:
+                    return
+                elif limit == Limit.LIMIT_REQUEST:
+                    while(threshold > self.countReqs()):
+                        before_instances = self.simulateStepWrapper(writer, before_instances)
+                elif limit == Limit.LIMIT_TIMESTEP:
+                    while(threshold > self.getStep() or self.countReqs() < self.sender.countReqs()):
+                        before_instances = self.simulateStepWrapper(writer, before_instances)
+                elif limit == Limit.LIMIT_TIME:
+                    while(threshold > self.getTime() or self.countReqs() < self.sender.countReqs()):
+                        before_instances = self.simulateStepWrapper(writer, before_instances)
+            finally:
+                self._num_instance_fh = None
 
         return
 
@@ -178,13 +212,30 @@ class QueueSimulator:
         max_batches = int(self.config.STEADY_MAX_BATCHES)
         consecutive = int(self.config.STEADY_CONSECUTIVE)
         rel_tol = float(self.config.STEADY_REL_TOL)
+        wait_abs_tol = getattr(self.config, "STEADY_WAIT_ABS_TOL", None)
+        wait_negligible_frac = getattr(self.config, "STEADY_WAIT_NEGLIGIBLE_FRAC", None)
+        warmup_time = float(getattr(self.config, "STEADY_WARMUP_TIME", 0.0) or 0.0)
 
-        sim_time = self.getTime()
-        hot = self.getNumOfHotInstance()
-        self.steady_acc = BatchAccumulator(t0=sim_time)
-        self.steady_acc.note_instances(sim_time, hot)
-        self.steady_batches = []
-        self.steady_reached = False
+        if not self._resumed:
+            self.steady_acc = None
+            self.steady_batches = []
+            self.steady_reached = False
+
+        if warmup_time > 0 and self.getTime() < warmup_time:
+            while self.getTime() < warmup_time:
+                before_instances = self.simulateStepWrapper(writer, before_instances)
+            print(
+                f"[steady] warmup complete t={self.getTime():.3f} "
+                f"(target={warmup_time:.3f})",
+                flush=True,
+            )
+            self._write_checkpoint(before_instances, force=True)
+
+        if self.steady_acc is None:
+            sim_time = self.getTime()
+            hot = self.getNumOfHotInstance()
+            self.steady_acc = BatchAccumulator(t0=sim_time)
+            self.steady_acc.note_instances(sim_time, hot)
 
         while True:
             before_instances = self.simulateStepWrapper(writer, before_instances)
@@ -229,7 +280,13 @@ class QueueSimulator:
                         flush=True,
                     )
 
-                if consecutive_stable(self.steady_batches, consecutive, rel_tol):
+                if consecutive_stable(
+                    self.steady_batches,
+                    consecutive,
+                    rel_tol,
+                    wait_abs_tol=wait_abs_tol,
+                    wait_negligible_frac=wait_negligible_frac,
+                ):
                     self.steady_reached = True
                     self.steady_result = merge_batches(
                         self.steady_batches[-consecutive:], self.steady_z
@@ -244,6 +301,7 @@ class QueueSimulator:
 
                 self.steady_acc = BatchAccumulator(t0=sim_time)
                 self.steady_acc.note_instances(sim_time, hot)
+                self._write_checkpoint(before_instances, force=True)
 
     def ensureOnlineArrivals(self, until_logical_time=None):
         if not self.steady_enabled:
@@ -287,6 +345,7 @@ class QueueSimulator:
             writer.writerow([str(simtime), str(step), num_instances])
             before_instances = num_instances
         self.incrementStep()
+        self._write_checkpoint(num_instances, force=False)
         return num_instances
 
     def fastForwardIdleSteps(self):
@@ -306,7 +365,6 @@ class QueueSimulator:
         self.timestep += skip_steps
 
     def hasImmediateEvent(self, step):
-        sender = self.getSender()
         scaler = self.getCluster().getScaler()
         balancer = self.getCluster().getBalancer()
 
@@ -327,42 +385,33 @@ class QueueSimulator:
             if not self.enable_scale_check_skip or scaler.containerScaleCheckNeeded():
                 return True
 
-        serverless_idle_steps = self.config.CONFIG_SERVERLESS_TIMER * self.config.SIM_STEP_PER_TIME
         defer_idle = (
             self.mode == Flg.FLG_SERVERLESS_WARM_WAIT
             and bool(balancer.getRequests())
         )
-        for instance in scaler.getRunnableInstances():
-            status = instance.getStatus()
-
-            if status == Status.SETUP:
+        if defer_idle:
+            # Idle deactivation is deferred; still check setup/shutdown/busy indexes.
+            for instance in scaler.setup_instances:
                 if isinstance(instance, Serverless):
                     if instance.setuptimer <= 1:
                         return True
                 elif instance.setuptimer <= 0:
                     return True
-
-            if status == Status.SHUTDOWN and instance.deactivatetimer <= 0:
-                return True
-
-            if status != Status.ACTIVE and status != Status.WORKING:
-                continue
-
-            exec_queue = instance.exec_queue
-            queue = instance.queue
-
-            if queue and any(slot is None for slot in exec_queue):
-                return True
-
-            for req in exec_queue:
-                if req is not None and req.workload <= 0:
+            for instance in scaler.shutdown_instances:
+                if instance.deactivatetimer <= 0:
                     return True
-
-            if Flg.is_serverless(self.mode) and status == Status.ACTIVE and not defer_idle:
-                if step - instance.getLastTime() >= serverless_idle_steps:
+            for instance in scaler.busy_instances:
+                status = instance.getStatus()
+                if status in (Status.SETUP, Status.SHUTDOWN):
+                    continue
+                if instance.queue and any(slot is None for slot in instance.exec_queue):
                     return True
+                for req in instance.exec_queue:
+                    if req is not None and req.workload <= 0:
+                        return True
+            return False
 
-        return False
+        return scaler.has_transition_or_busy_immediate(step)
 
     def getNextArrivalStep(self):
         sender = self.getSender()
@@ -398,43 +447,11 @@ class QueueSimulator:
                     next_check = step + interval
                 candidates.append(next_check)
 
-        serverless_idle_steps = self.config.CONFIG_SERVERLESS_TIMER * self.config.SIM_STEP_PER_TIME
         defer_idle = (
             self.mode == Flg.FLG_SERVERLESS_WARM_WAIT
             and bool(self.getCluster().getBalancer().getRequests())
         )
-
-        for instance in scaler.getRunnableInstances():
-            status = instance.getStatus()
-
-            if status == Status.SETUP:
-                if isinstance(instance, Serverless):
-                    candidate = step + max(1, instance.setuptimer - 1)
-                else:
-                    candidate = step + max(1, instance.setuptimer)
-                candidates.append(candidate)
-                continue
-
-            if status == Status.SHUTDOWN:
-                candidates.append(step + max(1, instance.deactivatetimer))
-                continue
-
-            if status != Status.ACTIVE and status != Status.WORKING:
-                continue
-
-            if Flg.is_serverless(self.mode) and status == Status.ACTIVE and not defer_idle:
-                deactivate_step = instance.getLastTime() + serverless_idle_steps
-                if deactivate_step > step:
-                    candidates.append(deactivate_step)
-
-            for req in instance.exec_queue:
-                if req is None:
-                    continue
-                if req.workload <= 0:
-                    candidates.append(step)
-                    continue
-                processing_steps = int(math.ceil(req.workload / instance.processing_capacity))
-                candidates.append(step + processing_steps)
+        candidates.extend(scaler.collect_next_event_candidates(step, defer_idle=defer_idle))
 
         if not candidates:
             return None
@@ -443,43 +460,13 @@ class QueueSimulator:
     def advanceBusyWork(self, skip_steps):
         if skip_steps <= 0:
             return
-
         step = self.getStep()
         scaler = self.getCluster().getScaler()
-        for instance in scaler.getRunnableInstances():
-            status = instance.getStatus()
-            if status == Status.SETUP:
-                instance.setuptimer -= skip_steps
-                continue
-
-            if status == Status.SHUTDOWN:
-                instance.deactivatetimer -= skip_steps
-                continue
-
-            if status != Status.ACTIVE and status != Status.WORKING:
-                continue
-
-            busy_slots = 0
-            for req in instance.exec_queue:
-                if req is None:
-                    continue
-                if req.workload > 0:
-                    req.workload -= instance.processing_capacity * skip_steps
-                    busy_slots += 1
-
-            if busy_slots > 0:
-                instance.CpuCtr += busy_slots * skip_steps
-                if Flg.is_serverless(self.mode):
-                    instance.setLastTime(step + skip_steps - 1)
+        scaler.advance_indexed_busy_work(step, skip_steps)
     
     def getNumOfHotInstance(self):
         scaler = self.getCluster().getScaler()
-        num = 0
-        for instance in scaler.getRunnableInstances():
-            status = instance.getStatus()
-            if status == Status.ACTIVE or status == Status.WORKING:
-                num += 1
-        return num
+        return int(getattr(scaler, "hot_count", 0))
     
     def simulateStep(self):
         sender = self.getSender()
@@ -491,18 +478,31 @@ class QueueSimulator:
         sender.runStep(cluster, step, self.step_per_time)
         balancer.runStep()
         scaler.runStep(step)
-        # list_length_step = []
-        # list_is_process_step = []
-        for instance in tuple(scaler.getRunnableInstances()):
+        for instance in tuple(scaler.instances_needing_step(step)):
             reqs = instance.runStep(step)
             self.registerReqs(reqs)
-        #     list_length_step.append(length)
-        #     list_is_process_step.append(is_process)
-        # self.list_length.append(list_length_step)
-        # self.list_is_process.append(list_is_process_step)
         
         return
     
+    def _write_checkpoint(self, before_instances, force=False):
+        if not self._checkpoint_enabled:
+            return
+        now = time.time()
+        if not force:
+            if self._checkpoint_interval_sec <= 0:
+                return
+            if (now - self._last_checkpoint_wall) < self._checkpoint_interval_sec:
+                return
+        if self._num_instance_fh is not None:
+            self._num_instance_fh.flush()
+        path = save_checkpoint(self, before_instances)
+        self._last_checkpoint_wall = now
+        print(
+            f"[checkpoint] saved t={self.getTime():.3f} completed={self.num_reqs} "
+            f"batches={len(self.steady_batches)} path={path}",
+            flush=True,
+        )
+
     def endSimulate(self, flg):
         import time as wall_time
         print("==SIMULATION FINISHED==")
