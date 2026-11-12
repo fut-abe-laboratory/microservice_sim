@@ -775,6 +775,7 @@ class QueueSimulator:
     
     def createInstances(self):
         cluster = self.getCluster()
+        scaler = cluster.getScaler()
 
         if self.config.CONFIG_DEFAULT_FLG == True:
             if self.config.CONFIG_DEFAULT_NUM <= 0:
@@ -782,14 +783,14 @@ class QueueSimulator:
             capacity = self.config.CONFIG_DEFAULT_CAPACITY
             num_CPU = self.config.CONFIG_DEFAULT_num_CPU
             queue_length = self.config.CONFIG_DEFAULT_QUEUE_LENGTH
-            status = self.config.CONFIG_DEFAULT_STATUS
 
             default_start_instances = getattr(
                 self.config,
                 "CONFIG_DEFAULT_START_INSTANCES",
                 1 if self.mode == Flg.FLG_CONTAINER else 0,
             )
-            default_start_instances = max(0, min(int(default_start_instances), self.config.CONFIG_DEFAULT_NUM))
+            pool_n = int(self.config.CONFIG_DEFAULT_NUM)
+            default_start_instances = max(0, min(int(default_start_instances), pool_n))
 
             # Stagger serverless idle timers across initially ACTIVE instances.
             # last_time is in steps (same unit as timestep). Idle age of the k-th
@@ -800,19 +801,23 @@ class QueueSimulator:
                 else None
             )
 
-            for i in range(self.config.CONFIG_DEFAULT_NUM):
-                initial_status = Status.ACTIVE if i < default_start_instances else status
-                instance = self.createInstance(capacity, num_CPU, queue_length, initial_status)
-                instance.setId(i)
-                if (
-                    serverless_timer_steps is not None
-                    and initial_status == Status.ACTIVE
-                    and isinstance(instance, Serverless)
-                ):
-                    instance.setLastTime(-(i * serverless_timer_steps) // default_start_instances)
-                if not cluster.addInstance(instance):
-                    break
-                cluster.registerInstance2Scaler(instance)
+            if not cluster.reservePool(pool_n, num_CPU):
+                return
+
+            def factory(status):
+                return self.createInstance(capacity, num_CPU, queue_length, status)
+
+            scaler._cluster = cluster
+            scaler.set_instance_factory(factory)
+            scaler.init_pool(pool_n)
+            for i in range(default_start_instances):
+                instance = scaler.materialize_instance(i, Status.ACTIVE, from_free=False)
+                if serverless_timer_steps is not None and isinstance(instance, Serverless):
+                    instance.setLastTime(
+                        -(i * serverless_timer_steps) // default_start_instances
+                    )
+            for i in range(default_start_instances, pool_n):
+                scaler._push_free_id(i)
 
         else:
             for i, instance_conf in enumerate(self.config.CONFIG_INSTANCES):

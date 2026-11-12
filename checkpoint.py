@@ -3,6 +3,9 @@
 Packet and instance logs are not a simulator state. This module stores the
 mutable event-loop state (step, in-flight requests, instance timers, batch
 statistics, RNG) and restores it onto a freshly loaded arrival list.
+
+Version 2 stores only materialized (non-INACTIVE) instances for a lazy pool.
+Older checkpoint files are unsupported; delete them and restart incomplete runs.
 """
 
 from __future__ import annotations
@@ -12,7 +15,9 @@ import pickle
 
 import numpy as np
 
-CHECKPOINT_VERSION = 1
+from status import Status
+
+CHECKPOINT_VERSION = 2
 
 
 def checkpoint_path_for(result_csv_path: str) -> str:
@@ -97,6 +102,14 @@ def capture_state(sim, before_instances) -> dict:
     next_unsent_id = None
     if sender.request_ptr < len(sender.reqs):
         next_unsent_id = int(sender.reqs[sender.request_ptr].getId())
+
+    # Sparse: only materialized non-INACTIVE instances.
+    instance_snaps = []
+    for instance in scaler.getInstances():
+        if instance.getStatus() == Status.INACTIVE:
+            continue
+        instance_snaps.append(_snap_instance(instance))
+
     return {
         "version": CHECKPOINT_VERSION,
         "timestep": int(sim.getStep()),
@@ -124,9 +137,11 @@ def capture_state(sim, before_instances) -> dict:
         "scaler": {
             "num_active_instance": scaler.num_active_instance,
             "runnable_ids": [int(inst.getId()) for inst in scaler.getRunnableInstances()],
+            "pool_capacity": int(getattr(scaler, "pool_capacity", 0) or 0),
         },
         "cluster_num_active_cpu": cluster.num_active_CPU,
-        "instances": [_snap_instance(inst) for inst in scaler.getInstances()],
+        "cluster_pool_capacity": int(getattr(cluster, "pool_capacity", 0) or 0),
+        "instances": instance_snaps,
     }
 
 
@@ -148,7 +163,10 @@ def _resolve_request(found: dict, snap: dict):
 
 def apply_state(sim, state: dict) -> int:
     if int(state.get("version", 0)) != CHECKPOINT_VERSION:
-        raise ValueError(f"unsupported checkpoint version: {state.get('version')}")
+        raise ValueError(
+            f"unsupported checkpoint version: {state.get('version')} "
+            f"(need {CHECKPOINT_VERSION}; delete old *_checkpoint.pkl and restart)"
+        )
 
     found = _index_requests(sim)
     cluster = sim.getCluster()
@@ -156,7 +174,6 @@ def apply_state(sim, state: dict) -> int:
     balancer = cluster.getBalancer()
     sender = sim.getSender()
     generator = sim.getGenerator()
-    by_id = {int(inst.getId()): inst for inst in scaler.getInstances()}
 
     sim.setStep(int(state["timestep"]))
     sim.num_reqs = int(state["num_reqs"])
@@ -189,22 +206,37 @@ def apply_state(sim, state: dict) -> int:
     if sender.request_ptr < len(sender.reqs):
         sender.setNextRequestTime(sender.reqs[sender.request_ptr].getStartTime())
 
-    bal = state["balancer"]
-    balancer.last_instance = bal["last_instance"]
-    balancer.instances = [by_id[int(i)] for i in bal["instance_ids"]]
-    balancer.requests = [_resolve_request(found, snap) for snap in bal["requests"]]
-
     sc = state["scaler"]
-    scaler.num_active_instance = sc["num_active_instance"]
-    scaler.runnable_instances = [by_id[int(i)] for i in sc["runnable_ids"]]
-    scaler.runnable_instance_set = set(scaler.runnable_instances)
+    pool_capacity = int(sc.get("pool_capacity") or state.get("cluster_pool_capacity") or 0)
+    if pool_capacity <= 0:
+        pool_capacity = int(getattr(scaler, "pool_capacity", 0) or 0)
+    if pool_capacity <= 0:
+        raise ValueError("checkpoint missing pool_capacity")
+
+    # Reset lazy pool, then materialize snapped instances.
+    if scaler._instance_factory is None:
+        raise RuntimeError("instance factory missing on resume")
+    scaler.init_pool(pool_capacity)
+    scaler._cluster = cluster
+    cluster.pool_capacity = int(state.get("cluster_pool_capacity") or pool_capacity)
+    cluster.instances = []
     cluster.num_active_CPU = state["cluster_num_active_cpu"]
+    balancer.instances = []
+    balancer.requests = []
 
     from collections import deque
 
+    for inst_id in range(pool_capacity):
+        scaler._push_free_id(inst_id)
+
+    by_id = {}
     for snap in state["instances"]:
-        inst = by_id[int(snap["id"])]
-        inst.status = int(snap["status"])
+        status = int(snap["status"])
+        if status == Status.INACTIVE:
+            continue
+        inst = scaler.materialize_instance(int(snap["id"]), status, from_free=True)
+        # Direct field restore (avoid duplicate setStatus side effects).
+        inst.status = status
         inst.setuptimer = snap["setuptimer"]
         inst.deactivatetimer = snap["deactivatetimer"]
         inst.setCpuCtr(snap["cpu_ctr"])
@@ -221,6 +253,16 @@ def apply_state(sim, state: dict) -> int:
                 f"{len(restored_exec)} vs {len(inst.exec_queue)}"
             )
         inst.exec_queue = restored_exec
+        by_id[int(inst.getId())] = inst
+
+    bal = state["balancer"]
+    balancer.last_instance = bal["last_instance"]
+    balancer.instances = [by_id[int(i)] for i in bal["instance_ids"]]
+    balancer.requests = [_resolve_request(found, snap) for snap in bal["requests"]]
+
+    scaler.num_active_instance = sc["num_active_instance"]
+    scaler.runnable_instances = [by_id[int(i)] for i in sc["runnable_ids"]]
+    scaler.runnable_instance_set = set(scaler.runnable_instances)
 
     if hasattr(scaler, "rebuild_schedule_indexes"):
         scaler.rebuild_schedule_indexes()

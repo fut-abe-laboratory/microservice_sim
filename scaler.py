@@ -11,7 +11,13 @@ class Scaler:
     def __init__(self, balancer, config: Config):
         self.config = config
         self.setBalancer(balancer)
-        self.instances = []
+        # Fixed-capacity pool: only non-INACTIVE instances are materialized.
+        self.pool_capacity = 0
+        self._slots = []  # index = instance id; None => free/INACTIVE
+        self._free_set = set()
+        self._free_heap = []  # min-heap of free ids (lazy deletion vs _free_set)
+        self._instance_factory = None  # fn(status) -> Instance
+        self.instances = []  # materialized only (compat / iteration helpers)
         self.runnable_instances = []
         self.runnable_instance_set = set()
         self.num_active_instance = 0
@@ -22,8 +28,100 @@ class Scaler:
         self.busy_instances = set()
         self.force_step_instances = set()
         self.hot_count = 0
-        self._idle_heap = []  # (deadline_step, last_time, inst_id, instance)
+        self._idle_heap = []  # (deadline_step, last_time, inst_id)
         return
+
+    def set_instance_factory(self, factory):
+        """factory(status) -> Instance (id unset)."""
+        self._instance_factory = factory
+
+    def init_pool(self, capacity: int):
+        capacity = int(capacity)
+        if capacity < 0:
+            raise ValueError("pool capacity must be non-negative")
+        self.pool_capacity = capacity
+        self._slots = [None] * capacity
+        self._free_set = set()
+        self._free_heap = []
+        self.instances = []
+
+    def _push_free_id(self, inst_id: int):
+        inst_id = int(inst_id)
+        if inst_id in self._free_set:
+            return
+        self._free_set.add(inst_id)
+        heapq.heappush(self._free_heap, inst_id)
+
+    def _take_free_id(self, inst_id: int | None = None):
+        if inst_id is not None:
+            inst_id = int(inst_id)
+            if inst_id not in self._free_set:
+                return None
+            self._free_set.remove(inst_id)
+            return inst_id
+        while self._free_heap:
+            cand = heapq.heappop(self._free_heap)
+            if cand in self._free_set:
+                self._free_set.remove(cand)
+                return cand
+        return None
+
+    def materialize_instance(self, inst_id: int, status, *, from_free: bool = False):
+        """Create instance at id and register it.
+
+        from_free=True requires the id to be on the free-list (scale-out / cold-start).
+        from_free=False is for initial starters (id not yet on the free-list).
+        """
+        inst_id = int(inst_id)
+        if inst_id < 0 or inst_id >= self.pool_capacity:
+            raise ValueError(f"instance id {inst_id} out of pool range")
+        if self._slots[inst_id] is not None:
+            raise ValueError(f"slot {inst_id} is already materialized")
+        if from_free:
+            if self._take_free_id(inst_id) is None:
+                raise ValueError(f"id {inst_id} is not free")
+        elif inst_id in self._free_set:
+            raise ValueError(f"id {inst_id} unexpectedly marked free")
+        if self._instance_factory is None:
+            raise RuntimeError("instance factory is not set")
+        instance = self._instance_factory(status)
+        instance.setId(inst_id)
+        self._slots[inst_id] = instance
+        self.instances.append(instance)
+        instance.setStatusManager(self)
+        cluster = getattr(self, "_cluster", None)
+        if cluster is not None and hasattr(cluster, "noteMaterializedInstance"):
+            cluster.noteMaterializedInstance(instance)
+        if instance.getStatus() != Status.INACTIVE:
+            self.registerRunnableInstance(instance)
+        if instance.getStatus() == Status.ACTIVE:
+            self.num_active_instance += 1
+            self.registerInstance2Balancer(instance)
+        self.refresh_instance_schedule(instance)
+        return instance
+
+    def release_inactive_instance(self, instance):
+        """Dematerialize an INACTIVE instance and return its id to the free-list."""
+        if instance.getStatus() != Status.INACTIVE:
+            return
+        inst_id = int(instance.getId())
+        if inst_id < 0 or inst_id >= self.pool_capacity:
+            return
+        if self._slots[inst_id] is not instance:
+            return
+        self.removeRunnableInstance(instance)
+        self._slots[inst_id] = None
+        if instance in self.instances:
+            self.instances.remove(instance)
+        instance.setStatusManager(None)
+        self._push_free_id(inst_id)
+        # Keep cluster.instances in sync when present.
+        cluster = getattr(self, "_cluster", None)
+        if cluster is not None and hasattr(cluster, "noteDematerializedInstance"):
+            cluster.noteDematerializedInstance(instance)
+
+    def get_slot(self, inst_id: int):
+        return self._slots[int(inst_id)]
 
     def runStep(self, timestep):
         if self.mode == Flg.FLG_CONTAINER:
@@ -57,23 +155,21 @@ class Scaler:
         due = []
         seen = set()
         while self._idle_heap:
-            deadline, last_time, inst_id, instance = self._idle_heap[0]
+            deadline, last_time, inst_id = self._idle_heap[0]
             if deadline > timestep:
                 break
             heapq.heappop(self._idle_heap)
-            if instance.getStatus() != Status.ACTIVE:
-                continue
-            if int(instance.getId()) != inst_id:
+            instance = self.get_slot(inst_id)
+            if instance is None or instance.getStatus() != Status.ACTIVE:
                 continue
             if int(getattr(instance, "last_time", -1)) != last_time:
                 continue
             if timestep - last_time < idle_steps:
                 continue
             # Heap may hold duplicate (deadline, last_time) entries for one instance.
-            key = int(instance.getId())
-            if key in seen:
+            if inst_id in seen:
                 continue
-            seen.add(key)
+            seen.add(inst_id)
             due.append(instance)
         for instance in due:
             self.deactivateOldInstance(instance)
@@ -86,7 +182,17 @@ class Scaler:
         return self.balancer
 
     def addInstance(self, instance):
+        """Legacy append path (non-pool configs). Prefer materialize_instance."""
         self.instances.append(instance)
+        if self.pool_capacity <= 0:
+            # Keep denselist mode working for CONFIG_INSTANCES rows.
+            while len(self._slots) <= int(instance.getId()):
+                self._slots.append(None)
+            self.pool_capacity = len(self._slots)
+        inst_id = int(instance.getId())
+        if 0 <= inst_id < len(self._slots):
+            self._slots[inst_id] = instance
+            self._free_set.discard(inst_id)
         instance.setStatusManager(self)
         if instance.getStatus() != Status.INACTIVE:
             self.registerRunnableInstance(instance)
@@ -97,7 +203,11 @@ class Scaler:
         return
 
     def getInstances(self):
+        """Materialized instances only (INACTIVE are dematerialized)."""
         return self.instances
+
+    def getPoolCapacity(self):
+        return int(self.pool_capacity)
 
     def getRunnableInstances(self):
         return self.runnable_instances
@@ -150,7 +260,7 @@ class Scaler:
         deadline = int(last_time) + self._serverless_idle_steps()
         heapq.heappush(
             self._idle_heap,
-            (deadline, int(last_time), int(instance.getId()), instance),
+            (deadline, int(last_time), int(instance.getId())),
         )
 
     def refresh_instance_schedule(self, instance):
@@ -192,6 +302,9 @@ class Scaler:
             self.note_serverless_last_time(instance, instance.last_time)
 
     def on_instance_status_changed(self, instance, prev_status, status):
+        if status == Status.INACTIVE:
+            self.release_inactive_instance(instance)
+            return
         self.refresh_instance_schedule(instance)
 
     def rebuild_schedule_indexes(self):
@@ -218,8 +331,9 @@ class Scaler:
         if defer_idle or not Flg.is_serverless(self.mode):
             return None
         while self._idle_heap:
-            deadline, last_time, inst_id, instance = self._idle_heap[0]
-            if instance.getStatus() != Status.ACTIVE or int(instance.getId()) != inst_id:
+            deadline, last_time, inst_id = self._idle_heap[0]
+            instance = self.get_slot(inst_id)
+            if instance is None or instance.getStatus() != Status.ACTIVE:
                 heapq.heappop(self._idle_heap)
                 continue
             if int(getattr(instance, "last_time", -1)) != last_time:
@@ -315,11 +429,22 @@ class Scaler:
             self.refresh_instance_schedule(instance)
 
     def scaleOut(self, metrics):
+        # Walk ids ascending — same order as a dense instances[0..N) scan.
         ideal_num_instance = math.ceil(self.num_active_instance * metrics)
         num_active_instance = self.num_active_instance
-        for instance in self.getInstances():
+        for inst_id in range(self.pool_capacity):
             if ideal_num_instance <= num_active_instance:
                 return
+            instance = self._slots[inst_id]
+            if instance is None:
+                # Free/INACTIVE slot: activate this id (ascending order).
+                instance = self.materialize_instance(
+                    inst_id, Status.INACTIVE, from_free=True
+                )
+                instance.deactivatetimer = -1
+                instance.activateInstance(self)
+                num_active_instance += 1
+                continue
 
             status = instance.getStatus()
             if status == Status.SETUP:
@@ -335,19 +460,24 @@ class Scaler:
         return
 
     def coldStartInstance(self):
-        for instance in self.getInstances():
-            if instance.getStatus() == Status.INACTIVE:
-                instance.activateInstance(self)
-                self.registerInstance2Balancer(instance)
-                return instance
-        return None
+        # Equivalent to "first INACTIVE in ascending id order".
+        inst_id = self._take_free_id()
+        if inst_id is None:
+            return None
+        instance = self.materialize_instance(inst_id, Status.INACTIVE, from_free=False)
+        instance.activateInstance(self)
+        self.registerInstance2Balancer(instance)
+        return instance
 
     def scaleIn(self, metrics):
         ideal_num_instance = max(1, math.ceil(self.num_active_instance * metrics))
         num_active_instance = self.num_active_instance
-        for instance in reversed(self.getInstances()):
+        for inst_id in range(self.pool_capacity - 1, -1, -1):
             if ideal_num_instance >= num_active_instance:
                 return
+            instance = self._slots[inst_id]
+            if instance is None:
+                continue
             status = instance.getStatus()
             if status == Status.WORKING or status == Status.ACTIVE:
                 if instance.deactivatetimer < 0:
