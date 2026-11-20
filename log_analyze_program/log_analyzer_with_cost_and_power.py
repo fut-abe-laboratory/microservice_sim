@@ -148,8 +148,8 @@ def _lambda_compute_cost_with_tiers(gb_rate, dt, total_gb_seconds, tiers):
 def _build_scaling_state(scaling_df_sorted, scaling_time_col, scaling_num_col, initial_instances, startup_time_sec, shutdown_time_sec):
     """Precompute scaling events and startup/shutdown transition metadata."""
     scaling_events = []
-    startup_at = {}
-    shutdown_at = {}
+    startup_starts = []
+    shutdown_starts = []
     startup_ends = []
     shutdown_ends = []
 
@@ -165,20 +165,22 @@ def _build_scaling_state(scaling_df_sorted, scaling_time_col, scaling_num_col, i
 
         if new_num > prev_num:
             for inst_id in range(prev_num, new_num):
-                startup_at[inst_id] = row_time
+                startup_starts.append((row_time, inst_id))
                 startup_ends.append((row_time + startup_time_sec, inst_id))
 
         if new_num < prev_num:
             for inst_id in range(new_num, prev_num):
-                shutdown_at[inst_id] = row_time
+                shutdown_starts.append((row_time, inst_id))
                 shutdown_ends.append((row_time + shutdown_time_sec, inst_id))
 
         prev_num = new_num
 
     scaling_events.sort(key=lambda x: x[0])
+    startup_starts.sort(key=lambda x: x[0])
+    shutdown_starts.sort(key=lambda x: x[0])
     startup_ends.sort(key=lambda x: x[0])
     shutdown_ends.sort(key=lambda x: x[0])
-    return scaling_events, startup_at, shutdown_at, startup_ends, shutdown_ends
+    return scaling_events, startup_starts, shutdown_starts, startup_ends, shutdown_ends
 
 
 def analyze_logs(prefix, steps_per_second, compact_output=True, max_timesteps=5_000_000, generate_plots=False):
@@ -270,7 +272,7 @@ def analyze_logs(prefix, steps_per_second, compact_output=True, max_timesteps=5_
     # state is treated as constant on each interval [t_i, t_{i+1}), where t_i are
     # request/scaling/power-transition event timestamps.
     scaling_df_sorted = scaling_df.sort_values(by=scaling_time_col)
-    scaling_events, instance_startup_times, instance_shutdown_times, startup_ends, shutdown_ends = _build_scaling_state(
+    scaling_events, startup_starts, shutdown_starts, startup_ends, shutdown_ends = _build_scaling_state(
         scaling_df_sorted,
         scaling_time_col,
         scaling_num_col,
@@ -371,6 +373,8 @@ def analyze_logs(prefix, steps_per_second, compact_output=True, max_timesteps=5_
         active_idx = 0
         proc_idx = 0
         inst_idx = 0
+        startup_start_idx = 0
+        shutdown_start_idx = 0
         startup_end_idx = 0
         shutdown_end_idx = 0
 
@@ -448,12 +452,12 @@ def analyze_logs(prefix, steps_per_second, compact_output=True, max_timesteps=5_
                 break
 
             # Add newly started/stopping instance IDs at current t0.
-            for inst_id, st in instance_startup_times.items():
-                if st == t0:
-                    startup_active_ids.add(inst_id)
-            for inst_id, st in instance_shutdown_times.items():
-                if st == t0:
-                    shutdown_active_ids.add(inst_id)
+            while startup_start_idx < len(startup_starts) and startup_starts[startup_start_idx][0] == t0:
+                startup_active_ids.add(startup_starts[startup_start_idx][1])
+                startup_start_idx += 1
+            while shutdown_start_idx < len(shutdown_starts) and shutdown_starts[shutdown_start_idx][0] == t0:
+                shutdown_active_ids.add(shutdown_starts[shutdown_start_idx][1])
+                shutdown_start_idx += 1
 
             dt = t1 - t0
             num_inst = max(0, int(current_num_instances))

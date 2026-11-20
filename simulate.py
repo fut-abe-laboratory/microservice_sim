@@ -72,12 +72,18 @@ RESULT_HEADER = [
 # Runtime settings (edit here instead of using environment variables)
 SETTINGS = {
     # CSV file containing experiment configurations.
-    # Paper suites (run twice, switching this path):
-    #   "config_list_setup30.csv"  → experiment_id 20261111_setup30_steady (container setup/shutdown 30s)
-    #   "config_list_setup1.csv"   → experiment_id 20261111_setup1_steady  (container setup/shutdown 1s)
+    # Paper suites (same experiment_id within setup30 / setup1; analyzer merges):
+    #   Recommended order for earlier analysis:
+    #     1. config_list_setup30_core.csv   μ∈{0.1,1,10}, container 30s
+    #     2. config_list_setup1_core.csv    μ∈{0.1,1,10}, container 1s
+    #     3. config_list_setup30_mu100.csv  μ=100 (event-heavy under 600s batches)
+    #     4. config_list_setup1_mu100.csv
+    #     5. config_list_setup30_mu001.csv  μ=0.01 (wall-clock long pole)
+    #     6. config_list_setup1_mu001.csv
+    #   Full grids: config_list_setup30.csv / config_list_setup1.csv
     # Each suite includes serverless + serverless_warm_wait (always 1s) and containers CPU=1..64.
     # Regenerate with: python3 generate_paper_config_lists.py
-    "config_file": "config_list_setup30.csv",
+    "config_file": "config_list_setup30_core.csv",
     # Repeat index start (inclusive).
     "sim_count_start": 0,
     # Repeat index end (exclusive).
@@ -112,9 +118,11 @@ SETTINGS = {
     # Logical sim-time to run before the first measurement batch (transient discard).
     "steady_warmup_time": 900,
     # Minimum completed requests per measurement batch.
-    "steady_batch_reqs": 1000,
+    # 100 keeps low-λ wall time tractable; CI is reported but not used to stop.
+    "steady_batch_reqs": 100,
     # Minimum simulated time per batch. None => serverless timer / container heuristic.
-    "steady_batch_min_time": 60,
+    # 600s matches serverless idle so mid-λ windows cover ~1 idle cycle.
+    "steady_batch_min_time": 600,
     # Relative tolerance between consecutive batch means.
     "steady_rel_tol": 0.10,
     # When max(wait) or |Δwait| is below this fraction of min(total), treat wait as stable.
@@ -123,7 +131,7 @@ SETTINGS = {
     # Optional absolute cap on |Δwait| between batches (seconds). None => fraction rule only.
     "steady_wait_abs_tol": None,
     # Number of consecutive stable batches required.
-    "steady_consecutive": 2,
+    "steady_consecutive": 3,
     # Safety cap on number of batches.
     "steady_max_batches": 100000,
     # Write a resumable snapshot at least this often (wall-clock seconds).

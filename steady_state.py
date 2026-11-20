@@ -136,12 +136,21 @@ def _mean_stable(
     hi_key: str,
     rel_tol: float,
     eps: float = 1e-12,
+    use_ci_overlap: bool = False,
 ) -> bool:
+    """Mean relative check for stopping; CI overlap is opt-in only.
+
+    Confidence intervals are still computed for result reporting, but stopping on
+    overlap alone is too loose for small batches (wide CIs declare "stable" while
+    means are still drifting). Default is mean-only.
+    """
     a = float(prev[mean_key])
     b = float(curr[mean_key])
-    return _rel_delta_ok(a, b, rel_tol, eps) or _ci_overlap(
-        prev[lo_key], prev[hi_key], curr[lo_key], curr[hi_key]
-    )
+    if _rel_delta_ok(a, b, rel_tol, eps):
+        return True
+    if use_ci_overlap:
+        return _ci_overlap(prev[lo_key], prev[hi_key], curr[lo_key], curr[hi_key])
+    return False
 
 
 def _wait_stable(

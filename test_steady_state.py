@@ -51,6 +51,31 @@ class TestMetricsStable(unittest.TestCase):
         curr = _batch(0.01, 0.001)
         self.assertFalse(metrics_stable(prev, curr, self.rel_tol))
 
+    def test_wide_ci_overlap_does_not_force_stable(self):
+        """Small-n wide CIs must not stop the run while means still differ > rel_tol."""
+        prev = {
+            "ex_time_total": 0.020,
+            "ex_time_wait": 0.001,
+            "ave_instances": 1.0,
+            "n": 100,
+            "ci_total_low": 0.0,
+            "ci_total_high": 0.040,
+            "ci_wait_low": 0.0,
+            "ci_wait_high": 0.010,
+        }
+        curr = {
+            "ex_time_total": 0.012,
+            "ex_time_wait": 0.001,
+            "ave_instances": 1.0,
+            "n": 100,
+            "ci_total_low": 0.0,
+            "ci_total_high": 0.030,
+            "ci_wait_low": 0.0,
+            "ci_wait_high": 0.010,
+        }
+        # Means differ by 40%, but CIs fully overlap.
+        self.assertFalse(metrics_stable(prev, curr, self.rel_tol))
+
 
 if __name__ == "__main__":
     unittest.main()

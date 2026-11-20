@@ -107,11 +107,16 @@ CLI: `python simulate.py --generate-requests-only` でも同じ動作になり�
 | `enable_hybrid_skip` | アイドル区間のステップ飛ばし | `True` |
 | `enable_scale_check_skip` | コンテナの periodic scale チェックが no-op なら次到着まで飛ばす | `True` |
 | `steady_enabled` | シミュレータ内定常判定まで継続 | `True` |
+| `steady_warmup_time` | 最初の測定バッチ前に進める論理時間（過渡捨て） | `600` |
 | `steady_batch_reqs` | 1 バッチあたり最低完了リクエスト数 | `10000` |
-| `steady_batch_min_time` | 1 バッチ最低論理時間（`None` なら serverless=timer / container=4×scale_interval） | `None` |
+| `steady_batch_min_time` | 1 バッチ最低論理時間（`None` なら serverless=timer / container=4×scale_interval） | `60` |
 | `steady_rel_tol` | 連続バッチ平均の相対許容差 | `0.05` |
+| `steady_wait_negligible_frac` | 待機が `frac×min(total)` 以下なら安定扱い（`None` で `steady_rel_tol` と同じ） | `None` |
+| `steady_wait_abs_tol` | 待機の絶対差上限（秒）。`None` で無効 | `None` |
 | `steady_consecutive` | 定常とみなす連続安定バッチ数 | `3` |
 | `steady_max_batches` | バッチ数の上限（安全弁） | `50` |
+| `steady_checkpoint_enabled` | 実行中状態を保存し、強制終了後に同じ地点から再開 | `True` |
+| `steady_checkpoint_interval_sec` | チェックポイント間隔（壁時計・秒）。`0` ならバッチ完了時のみ | `600` |
 | `steady_ci_level` | バッチ平均の信頼水準 | `0.95` |
 | `steady_preextend_enabled` | 定常に必要な到着長の目安まで共有 CSV を事前延長 | `True` |
 | `steady_preextend_batches` | 事前延長のバッチ数目安（`None` なら `max(3K, K+10)`） | `None` |
@@ -122,7 +127,7 @@ CLI: `python simulate.py --generate-requests-only` でも同じ動作になり�
 
 1. `config_list.csv` からコメント行（先頭 `#`）以外を読み込む  
 2. 各 `(sim_index, config_row)` をタスクとする  
-3. 既に `OUTPUT_FILE`（`*_result.csv`）が非空ならそのタスクはスキップ（再開用）  
+3. `OUTPUT_FILE`（`*_result.csv`）にデータ行があり `steady_reached=True` ならそのタスクはスキップ（再開用。ヘッダのみの途中ファイルは未完了扱い）  
 4. 必要な `requests/*.csv` をメインプロセスで事前生成（ワーカー間の競合回避）  
 5. `ProcessPoolExecutor` で各タスクが `simulate(config)` を実行  
 6. 完了ごとにサマリ行を `SIM_DEFAULT_OUTPUT_FILE` へ追記  
@@ -159,9 +164,17 @@ CLI: `python simulate.py --generate-requests-only` でも同じ動作になり�
 
 到着列は比較のため **オフライン CSV が正** です。同一 `(threshold, λ, μ, sim_index)` の構成（container / serverless など）は同じファイルを読みます。起動時に定常到達の目安時間
 
-`horizon ≈ steady_preextend_batches × max(batch_min_time, batch_reqs/λ) × margin`
+`horizon ≈ steady_warmup_time + steady_preextend_batches × max(batch_min_time, batch_reqs/λ) × margin`
 
 （行数は `steady_preextend_max_rows` で上限）まで事前延長し、それでも足りない場合だけロック付きで追加生成して **同じ CSV に追記** します。後から走った構成や並列ワーカーは追記分を再利用するので、システム差だけを比較できます。本実験の投入順は `config_list.csv` の行順です。定常バッチ完了は親プロセスが `[steady] repeat=...` として表示します。
+
+**ウォームアップ**
+
+`steady_warmup_time`（既定 600 秒）の間はシミュレーションを進めますが、バッチ統計には含めません（`packet.csv` には記録されます）。測定バッチはウォームアップ終了時刻から開始します。
+
+**チェックポイント**
+
+`steady_checkpoint_enabled` が真のとき、壁時計で `steady_checkpoint_interval_sec` ごと、および測定バッチ完了時に `*_checkpoint.pkl` を書きます。同じ設定を再実行すると、完了済みの `result.csv` が無い場合にこのファイルから論理時刻・処理中リクエスト・台数状態・バッチ統計を復元し、`packet.csv` へ追記して続行します。強制終了で残ったログだけでは再開できません。
 
 **バッチ定義（ハイブリッド）**
 
@@ -178,7 +191,7 @@ CLI: `python simulate.py --generate-requests-only` でも同じ動作になり�
 - 相対差 ≤ `steady_rel_tol`、または
 - 95% CI が交差（台数は相対差のみ）
 
-なら定常到達とします。採用値は **その連続 K バッチを結合した平均** です。`steady_max_batches` に達した場合は `steady_reached=false` で末尾 K バッチを採用して終了します。
+なら定常到達とします。**待機時間**は、両バッチとも `max(wait) ≤ steady_wait_negligible_frac × min(total)`（未指定時は `steady_rel_tol` と同じ比率）または `|Δwait|` が同じ閾値以下のとき、系内時間に比べて無視できるとみなし安定扱いにします（微小値の相対変動で誤判定しないため）。`steady_wait_abs_tol` で秒単位の絶対上限も指定できます。採用値は **その連続 K バッチを結合した平均** です。`steady_max_batches` に達した場合は `steady_reached=false` で末尾 K バッチを採用して終了します。
 
 **出力の意味**
 
@@ -459,7 +472,7 @@ CSV 行から全パラメータを構築し、入出力パスを決定します�
 | `ci_*_low` / `ci_*_high` | 定常区間の応答時間系 95% CI |
 | `ave_instances_steady` | 定常区間の時間加重平均ホット台数 |
 
-既に非空ファイルがあるタスクはランナーがスキップします。
+`*_result.csv` に `steady_reached=True` のデータ行があるタスクはランナーがスキップします（ヘッダのみの途中ファイルは再実行されます）。
 
 ### 7.2 `*_packet.csv`（リクエスト単位の詳細）
 
