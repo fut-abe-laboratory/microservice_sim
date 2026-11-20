@@ -317,6 +317,13 @@ class Scaler:
         for instance in self.getRunnableInstances():
             instance._sched_hot = False
             self.refresh_instance_schedule(instance)
+            # Heal checkpoints taken while a scaled-in instance was still
+            # ACTIVE/WORKING with an armed deactivate timer.
+            if (
+                instance.getStatus() in (Status.ACTIVE, Status.WORKING)
+                and instance.deactivatetimer >= 0
+            ):
+                self.force_step_instances.add(instance)
 
     def instances_needing_step(self, timestep):
         """Instances that must run this step (skip warm-idle ACTIVE)."""
@@ -345,6 +352,8 @@ class Scaler:
         return None
 
     def has_transition_or_busy_immediate(self, step):
+        if self.force_step_instances:
+            return True
         for instance in self.setup_instances:
             if isinstance(instance, Serverless):
                 if instance.setuptimer <= 1:
@@ -483,6 +492,10 @@ class Scaler:
                 if instance.deactivatetimer < 0:
                     instance.deactivateInstance()
                     self.removeInstanceFromBalancer(instance)
+                # Event-driven stepping skips idle ACTIVE instances. Force one
+                # step so processRequests flips it to SHUTDOWN and the shutdown
+                # countdown starts (same as deactivateOldInstance for serverless).
+                self.force_step_instances.add(instance)
                 num_active_instance -= 1
             elif status == Status.SETUP:
                 instance.deactivateInstance()
