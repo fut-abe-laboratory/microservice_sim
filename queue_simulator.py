@@ -375,10 +375,9 @@ class QueueSimulator:
         if balancer.getRequests():
             # Warm-wait may intentionally keep requests queued; only treat as
             # immediate when an assign/cold-start can happen this step.
-            if self.mode == Flg.FLG_SERVERLESS_WARM_WAIT:
-                if balancer.hasAssignableOrScalableWork():
-                    return True
-            else:
+            # Only immediate when an assign (or warm-wait cold-start) can happen
+            # this step; otherwise wait for the next completion/setup/check event.
+            if balancer.hasAssignableOrScalableWork():
                 return True
 
         if self.mode == Flg.FLG_CONTAINER and scaler.isTime2Check(step):

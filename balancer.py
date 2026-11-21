@@ -177,6 +177,9 @@ class Balancer:
         """True if balancer queue can be progressed this step (assign or cold-start)."""
         if not self.getRequests():
             return False
+        if self.mode == Flg.FLG_CONTAINER:
+            # Container dispatch only targets ACTIVE/WORKING with an empty queue.
+            return self.chooseInstance() is not None
         if self.mode != Flg.FLG_SERVERLESS_WARM_WAIT:
             return True
         if self.hottest() is not None:

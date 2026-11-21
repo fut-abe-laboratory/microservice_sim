@@ -332,7 +332,10 @@ class Scaler:
         due.update(self.busy_instances)
         due.update(self.force_step_instances)
         self.force_step_instances.clear()
-        return due
+        # Deterministic, id-ascending order: same-step events (e.g. several
+        # setups finishing together) register to the balancer lowest id first,
+        # independent of object addresses.
+        return sorted(due, key=lambda i: i.getId())
 
     def next_serverless_idle_step(self, step, defer_idle=False):
         if defer_idle or not Flg.is_serverless(self.mode):
