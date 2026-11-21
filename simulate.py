@@ -392,7 +392,11 @@ def ensure_request_file_exists(config):
     _lambda = decimal_normalize(config.CONFIG_LAMBDA)
     mu = decimal_normalize(config.CONFIG_MU)
     generator = Generator(step_per_time, _lambda, mu, config)
-    generator.generate_and_write(req_file, config.SIM_LIMIT, config.SIM_THRESHOLD)
+    if config.SIM_LIMIT == Limit.LIMIT_REQUEST:
+        # Seeded chunks: the file is a pure function of (λ, μ, capacity, step, index).
+        generator.create_deterministic(req_file, int(config.SIM_THRESHOLD))
+    else:
+        generator.generate_and_write(req_file, config.SIM_LIMIT, config.SIM_THRESHOLD)
     return True
 
 

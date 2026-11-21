@@ -83,6 +83,20 @@ class TestDeterministicExtend(unittest.TestCase):
         a, b = _rows(paths[0]), _rows(paths[1])
         self.assertFalse(np.array_equal(a[10:20], b[10:20]))
 
+    def test_create_deterministic_is_reproducible(self):
+        paths = [os.path.join(self.root, f"c{k}.csv") for k in range(2)]
+        for k, p in enumerate(paths):
+            np.random.seed(k)  # global RNG must not matter
+            n = Generator(100000, 50.0, 10.0, _config()).create_deterministic(p, 20000)
+            self.assertGreaterEqual(n, 20000)
+        a, b = _rows(paths[0]), _rows(paths[1])
+        np.testing.assert_array_equal(a, b)
+        np.testing.assert_array_equal(a[:, 0], np.arange(len(a)))
+        self.assertTrue(np.all(np.diff(a[:, 2]) >= 0))
+        # Existing file: untouched.
+        self.assertEqual(Generator(100000, 50.0, 10.0, _config()).create_deterministic(paths[0], 10), 0)
+        np.testing.assert_array_equal(_rows(paths[0]), a)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -413,6 +413,30 @@ class Generator:
             self._append_generated_until(path, until_time, max_new, keep_in_memory=False)
             return max(0, self.next_id - before_id)
 
+    def create_deterministic(self, path, min_rows):
+        """Create the request CSV from id 0 with deterministic chunks.
+
+        Writes whole chunks until at least `min_rows` rows exist. Does nothing
+        when the file already has rows. Returns the number of rows written.
+        """
+        with self._file_lock(path):
+            if self._peek_last_row(path) is not None:
+                return 0
+            with open(path, "w", newline="") as f:
+                csv.writer(f).writerow(["id", "workload", "start"])
+            self._read_cursor = None
+            self.next_id = 0
+            self.max_loaded_id = -1
+            self.last_start_time = None
+            self.next_arrival_time = None
+            while self.next_id < int(min_rows):
+                # until_time=0 still appends one chunk (empty file) or stops
+                # (non-empty), so step the target by one chunk per call.
+                peek = self._peek_last_row(path)
+                target = 0.0 if peek is None else float(peek[1]) + 1e-9
+                self._append_generated_until(path, target, None, keep_in_memory=False)
+            return self.next_id
+
     def extendUntil(self, path, until_time, max_new=100000):
         """
         Make sure shared request CSV covers start_time <= until_time.
