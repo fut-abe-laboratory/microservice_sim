@@ -183,7 +183,8 @@ def _build_scaling_state(scaling_df_sorted, scaling_time_col, scaling_num_col, i
     return scaling_events, startup_starts, shutdown_starts, startup_ends, shutdown_ends
 
 
-def analyze_logs(prefix, steps_per_second, compact_output=True, max_timesteps=5_000_000, generate_plots=False):
+def analyze_logs(prefix, steps_per_second, compact_output=True, max_timesteps=5_000_000, generate_plots=False,
+                 container_setup_sec=30.0, container_shutdown_sec=30.0):
     request_log_file = f"{prefix}_packet.csv"
     scaling_log_file = f"{prefix}_num_instance.csv"
     output_csv_file = f"{prefix}_analysis.csv"
@@ -221,8 +222,9 @@ def analyze_logs(prefix, steps_per_second, compact_output=True, max_timesteps=5_
     CPU_IDLE_POWER_W = CPU_EXEC_POWER_W * 0.1  # Idle CPU consumes 10% of active CPU power
     SERVERLESS_STARTUP_TIME_SEC = 1.0
     SERVERLESS_SHUTDOWN_TIME_SEC = 1.0
-    CONTAINER_STARTUP_TIME_SEC = 30.0
-    CONTAINER_SHUTDOWN_TIME_SEC = 30.0
+    # Must match the simulated container setup/shutdown (e.g. 1s for the setup1 suites).
+    CONTAINER_STARTUP_TIME_SEC = float(container_setup_sec)
+    CONTAINER_SHUTDOWN_TIME_SEC = float(container_shutdown_sec)
 
     cpu_per_instance = parse_cpu_from_prefix(prefix)
     container_mem_gb_per_instance = cpu_per_instance * 2.0
@@ -677,6 +679,18 @@ if __name__ == "__main__":
         help="指定時のみPDFグラフを生成します（デフォルトは解析CSVのみ出力）。",
     )
     parser.add_argument(
+        "--container_setup_sec",
+        type=float,
+        default=30.0,
+        help="コンテナの起動時間（秒）。シミュレーションの default_setuptime と合わせる（既定 30）。",
+    )
+    parser.add_argument(
+        "--container_shutdown_sec",
+        type=float,
+        default=30.0,
+        help="コンテナの停止時間（秒）。シミュレーションの default_shutdowntime と合わせる（既定 30）。",
+    )
+    parser.add_argument(
         "--max_timesteps",
         type=int,
         default=5_000_000,
@@ -738,6 +752,8 @@ if __name__ == "__main__":
                     compact_output,
                     max_timesteps,
                     generate_plots,
+                    args.container_setup_sec,
+                    args.container_shutdown_sec,
                 ): cleaned
                 for cleaned in validated_prefixes
             }
@@ -749,4 +765,7 @@ if __name__ == "__main__":
                     print(f"エラー: {target} の解析中に例外が発生しました: {e}")
     else:
         for cleaned in validated_prefixes:
-            analyze_logs(cleaned, args.steps_per_second, compact_output, max_timesteps, generate_plots)
+            analyze_logs(
+                cleaned, args.steps_per_second, compact_output, max_timesteps, generate_plots,
+                args.container_setup_sec, args.container_shutdown_sec,
+            )
