@@ -1,6 +1,8 @@
 import numpy as np
 import numpy.random as rd
 import math
+import io
+import zlib
 import os
 import fcntl
 from contextlib import contextmanager
@@ -21,6 +23,8 @@ class Generator:
         self.next_id = 0
         self.max_loaded_id = -1
         self.last_start_time = None
+        # Incremental read cursor for the shared request CSV (see _read_rows_after).
+        self._read_cursor = None
         return
 
     def seed(self, seed_value):
@@ -101,6 +105,9 @@ class Generator:
         exists = os.path.isfile(outputfile) and os.path.getsize(outputfile) > 0
         write_header = not (append and exists)
         mode = "ab" if (append and exists) else "wb"
+        if mode == "wb":
+            # Rewriting the file invalidates any incremental read position.
+            self._read_cursor = None
         data = np.column_stack((ids, workloads, starts))
         with open(outputfile, mode) as f:
             if write_header:
@@ -172,11 +179,43 @@ class Generator:
             self.next_arrival_time = None
 
     def _read_rows_after(self, inputfile, after_id):
+        """Load rows with id > after_id.
+
+        Other workers only append to the shared CSV (under the file lock), so
+        rows before the previous read position cannot qualify again: anything
+        there had id <= the after_id used back then, and after_id never
+        decreases between reads. Only the appended tail is parsed. The cursor
+        is dropped (full re-read) if the file shrank, was replaced, or after_id
+        went backwards.
+        """
         added = []
         if not os.path.isfile(inputfile) or os.path.getsize(inputfile) == 0:
+            self._read_cursor = None
             return added
+        st = os.stat(inputfile)
+        cursor = getattr(self, "_read_cursor", None)
+        offset = 0
+        if (
+            cursor is not None
+            and cursor[0] == inputfile
+            and cursor[1] == (st.st_dev, st.st_ino)
+            and cursor[2] <= st.st_size
+            and int(after_id) >= cursor[3]
+        ):
+            offset = cursor[2]
+        with open(inputfile, "rb") as f:
+            f.seek(offset)
+            chunk = f.read()
+        # Consume complete lines only.
+        end = chunk.rfind(b"\n") + 1
+        if end <= 0:
+            return added
+        body = chunk[:end]
+        self._read_cursor = (inputfile, (st.st_dev, st.st_ino), offset + end, int(after_id))
         try:
-            data = np.loadtxt(inputfile, delimiter=",", skiprows=1, ndmin=2)
+            data = np.loadtxt(
+                io.BytesIO(body), delimiter=",", skiprows=1 if offset == 0 else 0, ndmin=2
+            )
         except ValueError:
             data = np.empty((0, 3))
         if data.size == 0:
@@ -195,6 +234,7 @@ class Generator:
         ids, workloads, starts = self._generate_arrays(limit, threshold)
         self.reqs = []
         self.max_loaded_id = -1
+        self._read_cursor = None
         self.next_id = 0
         self.last_start_time = None
         if starts.size:
@@ -266,69 +306,69 @@ class Generator:
                 continue
         return None
 
+    # Rows per deterministic generation chunk (see _append_generated_until).
+    GEN_CHUNK_ROWS = 16384
+
+    def _chunk_rng(self, start_id):
+        """RNG for the chunk that starts at `start_id`.
+
+        Seeded only by the stream identity (lambda, mu, capacity, step size,
+        sim index) and the chunk's first id, so the appended rows are the same
+        whichever worker extends the shared CSV and whenever it does so.
+        """
+        key = "|".join(
+            (
+                repr(float(self._lambda)),
+                repr(float(self.mu)),
+                repr(float(self.config.CONFIG_DEFAULT_CAPACITY)),
+                str(int(self.step_per_time)),
+                str(int(getattr(self.config, "SIM_INDEX", 0) or 0)),
+            )
+        )
+        stream = zlib.crc32(key.encode("utf-8"))
+        return np.random.Generator(np.random.PCG64(np.random.SeedSequence([stream, int(start_id)])))
+
     def _append_generated_until(self, path, until_time, max_new, keep_in_memory):
-        """Generate and append rows with start <= until_time. Caller must hold the lock."""
-        # Re-sync clock from the on-disk tail so a stale in-memory next_arrival_time
-        # cannot rewind below rows another worker (or earlier extend) already wrote.
+        """Append whole deterministic chunks until the CSV covers until_time.
+
+        Caller must hold the lock. The on-disk tail is the source of truth for
+        the next id and start time.
+        """
         peek = self._peek_last_row(path)
         if peek is not None:
             last_id, last_start = peek
-            self.next_id = max(self.next_id, int(last_id) + 1)
+            next_id = int(last_id) + 1
+            t0 = float(last_start)
+        else:
+            next_id = 0
+            t0 = 0.0
+        self.next_id = max(self.next_id, next_id)
+        if peek is not None:
             self.max_loaded_id = max(self.max_loaded_id, int(last_id))
-            if self.last_start_time is None or float(last_start) > float(self.last_start_time):
-                self.last_start_time = float(last_start)
-            self._invalidate_stale_next_arrival()
+            if self.last_start_time is None or t0 > float(self.last_start_time):
+                self.last_start_time = t0
 
-        remaining = max_new if max_new is not None else 10**12
+        limit = max_new if max_new is not None else 10**12
+        n = int(self.GEN_CHUNK_ROWS)
         created_ids = []
         created_work = []
         created_starts = []
-        min_start = None if self.last_start_time is None else float(self.last_start_time)
-        while remaining > 0:
-            first_t = self._ensure_next_arrival_time()
-            if first_t > until_time:
+        created = 0
+        while (peek is None and not created_ids) or t0 < until_time:
+            if created >= limit:
                 break
-            if min_start is not None and first_t <= min_start:
-                # Should be unreachable after invalidation; force a forward sample.
-                self.next_arrival_time = None
-                first_t = self._ensure_next_arrival_time()
-                if first_t > until_time or (min_start is not None and first_t <= min_start):
-                    break
-            dt = max(until_time - first_t, 0.0)
-            n_est = int(self._lambda * dt * 1.25) + 64
-            n_est = min(max(n_est, 1), remaining if remaining < 10**12 else n_est)
-            n_est = min(n_est, 100000)
-            first_w = self.calculateWorkload4Request(self.step_per_time)
-            if n_est == 1:
-                starts = np.array([first_t], dtype=np.float64)
-                workloads = np.array([first_w], dtype=np.float64)
-            else:
-                rest_s, rest_w = self._sample_batch(n_est - 1, first_t)
-                starts = np.concatenate((np.array([first_t], dtype=np.float64), rest_s))
-                workloads = np.concatenate((np.array([first_w], dtype=np.float64), rest_w))
-            keep = starts <= until_time
-            if min_start is not None:
-                keep = np.logical_and(keep, starts > min_start)
-            kept = int(np.count_nonzero(keep))
-            if kept:
-                ids = np.arange(self.next_id, self.next_id + kept, dtype=np.int64)
-                kept_starts = starts[keep]
-                created_ids.append(ids)
-                created_work.append(workloads[keep])
-                created_starts.append(kept_starts)
-                remaining -= kept
-                self.last_start_time = float(kept_starts[-1])
-                min_start = self.last_start_time
-                self.next_id += kept
-            overshoot = np.where(starts > until_time)[0]
-            if overshoot.size:
-                self.next_arrival_time = float(starts[overshoot[0]])
-                self._invalidate_stale_next_arrival()
-                break
-            self.next_arrival_time = None
-            if kept == 0:
-                break
+            rng = self._chunk_rng(next_id)
+            intervals = np.floor(rng.exponential(1.0 / self._lambda, size=n) * self.step_per_time)
+            starts = t0 + np.cumsum(intervals / self.step_per_time)
+            workloads = self.config.CONFIG_DEFAULT_CAPACITY * rng.exponential(1.0 / self.mu, size=n)
+            created_ids.append(np.arange(next_id, next_id + n, dtype=np.int64))
+            created_work.append(workloads)
+            created_starts.append(starts)
+            next_id += n
+            created += n
+            t0 = float(starts[-1])
 
+        self.next_arrival_time = None
         if not created_ids:
             return []
         ids = np.concatenate(created_ids)
@@ -340,7 +380,6 @@ class Generator:
         self.max_loaded_id = max(self.max_loaded_id, int(ids[-1]))
         self.next_id = max(self.next_id, int(ids[-1]) + 1)
         self.last_start_time = float(np.max(starts))
-        self._invalidate_stale_next_arrival()
         return []
 
     def ensure_file_until(self, path, until_time, max_new=None):
