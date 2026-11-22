@@ -184,7 +184,8 @@ def _build_scaling_state(scaling_df_sorted, scaling_time_col, scaling_num_col, i
 
 
 def analyze_logs(prefix, steps_per_second, compact_output=True, max_timesteps=5_000_000, generate_plots=False,
-                 container_setup_sec=30.0, container_shutdown_sec=30.0):
+                 container_setup_sec=30.0, container_shutdown_sec=30.0,
+                 serverless_setup_sec=1.0, serverless_shutdown_sec=1.0):
     request_log_file = f"{prefix}_packet.csv"
     scaling_log_file = f"{prefix}_num_instance.csv"
     output_csv_file = f"{prefix}_analysis.csv"
@@ -220,8 +221,9 @@ def analyze_logs(prefix, steps_per_second, compact_output=True, max_timesteps=5_
     SERVERLESS_BASE_POWER_W = 3.0
     CPU_EXEC_POWER_W = 10.0
     CPU_IDLE_POWER_W = CPU_EXEC_POWER_W * 0.1  # Idle CPU consumes 10% of active CPU power
-    SERVERLESS_STARTUP_TIME_SEC = 1.0
-    SERVERLESS_SHUTDOWN_TIME_SEC = 1.0
+    # Must match the simulated serverless setup/shutdown (cold start) time.
+    SERVERLESS_STARTUP_TIME_SEC = float(serverless_setup_sec)
+    SERVERLESS_SHUTDOWN_TIME_SEC = float(serverless_shutdown_sec)
     # Must match the simulated container setup/shutdown (e.g. 1s for the setup1 suites).
     CONTAINER_STARTUP_TIME_SEC = float(container_setup_sec)
     CONTAINER_SHUTDOWN_TIME_SEC = float(container_shutdown_sec)
@@ -691,6 +693,18 @@ if __name__ == "__main__":
         help="コンテナの停止時間（秒）。シミュレーションの default_shutdowntime と合わせる（既定 30）。",
     )
     parser.add_argument(
+        "--serverless_setup_sec",
+        type=float,
+        default=1.0,
+        help="serverless の起動（コールドスタート）時間（秒）。シミュレーションと合わせる（既定 1）。",
+    )
+    parser.add_argument(
+        "--serverless_shutdown_sec",
+        type=float,
+        default=1.0,
+        help="serverless の停止時間（秒）。シミュレーションと合わせる（既定 1）。",
+    )
+    parser.add_argument(
         "--max_timesteps",
         type=int,
         default=5_000_000,
@@ -754,6 +768,8 @@ if __name__ == "__main__":
                     generate_plots,
                     args.container_setup_sec,
                     args.container_shutdown_sec,
+                    args.serverless_setup_sec,
+                    args.serverless_shutdown_sec,
                 ): cleaned
                 for cleaned in validated_prefixes
             }
@@ -768,4 +784,5 @@ if __name__ == "__main__":
             analyze_logs(
                 cleaned, args.steps_per_second, compact_output, max_timesteps, generate_plots,
                 args.container_setup_sec, args.container_shutdown_sec,
+                args.serverless_setup_sec, args.serverless_shutdown_sec,
             )
