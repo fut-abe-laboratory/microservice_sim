@@ -390,15 +390,9 @@ class QueueSimulator:
         )
         if defer_idle:
             # Idle deactivation is deferred; still check setup/shutdown/busy indexes.
-            for instance in scaler.setup_instances:
-                if isinstance(instance, Serverless):
-                    if instance.setuptimer <= 1:
-                        return True
-                elif instance.setuptimer <= 0:
-                    return True
-            for instance in scaler.shutdown_instances:
-                if instance.deactivatetimer <= 0:
-                    return True
+            due = scaler.min_timer_due()
+            if due is not None and due <= scaler.timer_passes + 1:
+                return True
             for instance in scaler.busy_instances:
                 status = instance.getStatus()
                 if status in (Status.SETUP, Status.SHUTDOWN):
@@ -408,6 +402,8 @@ class QueueSimulator:
                 for req in instance.exec_queue:
                     if req is not None and req.workload <= 0:
                         return True
+                if scaler.needs_idle_flip(instance):
+                    return True
             return False
 
         return scaler.has_transition_or_busy_immediate(step)
@@ -708,6 +704,8 @@ class QueueSimulator:
     def registerReqs(self, reqs):
         if self.steady_enabled:
             self._packet_streamed = True
+            if not reqs:
+                return
             outfile = self.config.OUTPUT_FILE_PACKET
             with open(outfile, 'a', newline='') as f:
                 writer = csv.writer(f)

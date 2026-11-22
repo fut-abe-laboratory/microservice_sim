@@ -3,6 +3,8 @@ from instance import Instance
 from status import Status
 from config import Config
 from sim_flg import Flg
+import heapq
+import math
 
 class Balancer:
 
@@ -10,11 +12,38 @@ class Balancer:
         self.config = config
         self.instances: list[Instance] = []
         self.requests: list[Request] = []
-        self.last_instance = -1
+        self._last_instance_idx = -1
+        self._last_instance_obj = None
         self.mode = self.config.CONFIG_INSTANCE_FLG
         self.scaler = None
+        # hottest() index: lazy max-heap of (-last_time, reg_seq, push_no, inst).
+        # reg_seq follows the order of self.instances, so ties on last_time
+        # resolve to the earliest-listed instance exactly like the linear scan.
+        self._reg_seq = 0
+        self._hot_push = 0
+        self._hot_heap = []
         return
     
+    @property
+    def last_instance(self):
+        """Index of the last forwarded-to instance (only roundRobin reads it).
+
+        Resolved lazily: forward2Instance used to call list.index() on every
+        assignment, which is O(N) with tens of thousands of instances.
+        """
+        obj = self._last_instance_obj
+        if obj is not None:
+            try:
+                return self.instances.index(obj)
+            except ValueError:
+                pass
+        return self._last_instance_idx
+
+    @last_instance.setter
+    def last_instance(self, value):
+        self._last_instance_idx = value
+        self._last_instance_obj = None
+
     def setScaler(self, scaler):
         self.scaler = scaler
         return
@@ -39,6 +68,10 @@ class Balancer:
     
     def addInstance(self, instance):
         self.instances.append(instance)
+        if getattr(instance, "_bal_seq", None) is None:
+            instance._bal_seq = self._reg_seq
+            self._reg_seq += 1
+        self.note_hot_candidate(instance)
         return
     
     def delInstance(self, instance):
@@ -47,7 +80,49 @@ class Balancer:
         except ValueError:
             # Already unregistered (e.g. duplicate idle-timeout deactivation).
             pass
+        else:
+            if instance not in self.instances:
+                instance._bal_seq = None
         return
+
+    # --- hottest() index ----------------------------------------------------
+    def _uses_hot_index(self):
+        return self.mode in (Flg.FLG_SERVERLESS, Flg.FLG_SERVERLESS_WARM_WAIT)
+
+    def note_hot_candidate(self, instance):
+        """Push instance if it is currently eligible for hottest()."""
+        if not self._uses_hot_index():
+            return
+        seq = getattr(instance, "_bal_seq", None)
+        if seq is None or instance.status != Status.ACTIVE or instance.queue:
+            return
+        last_time = instance.getLastTime()
+        self._hot_push += 1
+        heapq.heappush(self._hot_heap, (-last_time, seq, self._hot_push, instance))
+        if len(self._hot_heap) > 4 * len(self.instances) + 4096:
+            self.rebuild_hot_index(reassign=False)
+
+    def rebuild_hot_index(self, reassign=True):
+        """Rebuild from self.instances (after checkpoint restore or compaction)."""
+        if reassign:
+            for instance in self.instances:
+                instance._bal_seq = None
+            self._reg_seq = 0
+            for instance in self.instances:
+                if getattr(instance, "_bal_seq", None) is None:
+                    instance._bal_seq = self._reg_seq
+                    self._reg_seq += 1
+        self._hot_heap = []
+        self._hot_push = 0
+        if not self._uses_hot_index():
+            return
+        entries = []
+        for instance in self.instances:
+            if instance.status == Status.ACTIVE and not instance.queue:
+                self._hot_push += 1
+                entries.append((-instance.getLastTime(), instance._bal_seq, self._hot_push, instance))
+        heapq.heapify(entries)
+        self._hot_heap = entries
     
     def getInstance(self, i: int):
         return self.instances[i]
@@ -72,13 +147,57 @@ class Balancer:
     def manageQueue(self):
         reqs = self.getRequests()
         remain_reqs = []
-        for req in reqs:
+        i = 0
+        n = len(reqs)
+        while i < n:
+            req = reqs[i]
+            i += 1
             # 1-based position among still-unassigned requests (FIFO front = 1).
             queue_position = len(remain_reqs) + 1
             if self.tryForward2Instance(req, queue_len=queue_position) is None:
                 remain_reqs.append(req)
+                if self._noFurtherAssignmentThisStep():
+                    # Nothing changed by the failed attempt, so every later
+                    # request would fail the same way; keep them queued.
+                    remain_reqs.extend(reqs[i:])
+                    break
+                skip = self._warmWaitPositionsStillWaiting(queue_position)
+                if skip > 0:
+                    remain_reqs.extend(reqs[i:i + skip])
+                    i += skip
         reqs[:] = remain_reqs
         return
+
+    def _warmWaitPositionsStillWaiting(self, queue_position):
+        """Warm-wait chose to wait at `queue_position`: how many next requests also wait?
+
+        A failed chooseInstance() changes no state, so hottest() and
+        idleSetupInstance() stay None and the warm capacity W is unchanged.
+        The next requests get positions p+1, p+2, ... and wait exactly while
+        p+j <= S * W * mu (see shouldColdStartRatherThanWait).
+        """
+        if self.mode != Flg.FLG_SERVERLESS_WARM_WAIT:
+            return 0
+        warm_cpus = self.countWarmCapacity()
+        mu = float(self.config.CONFIG_MU)
+        if warm_cpus <= 0 or mu <= 0:
+            return 0
+        absorb = float(self.config.CONFIG_DEFAULT_SETUPTIME) * warm_cpus * mu
+        return max(0, math.floor(absorb) - max(int(queue_position), 1))
+
+    def _noFurtherAssignmentThisStep(self):
+        """After chooseInstance() returned None: can a later request still be placed?
+
+        Serverless returns None only when no warm instance is idle and the pool
+        has no free slot. Warm-wait returns None either by choice (position too
+        early to cold-start) or because the pool is full; only the latter holds
+        for every later position.
+        """
+        if self.mode == Flg.FLG_SERVERLESS:
+            return True
+        if self.mode == Flg.FLG_SERVERLESS_WARM_WAIT:
+            return not self.getScaler().hasFreeSlot()
+        return False
     
     def tryForward2Instance(self, req, queue_len=None):
         instance = self.chooseInstance(queue_len=queue_len)
@@ -180,12 +299,18 @@ class Balancer:
         if self.mode == Flg.FLG_CONTAINER:
             # Container dispatch only targets ACTIVE/WORKING with an empty queue.
             return self.chooseInstance() is not None
+        if self.mode == Flg.FLG_SERVERLESS:
+            # hottest() or a cold start; with a full pool and no idle warm
+            # instance nothing can change until a setup / completion / shutdown.
+            return self.getScaler().hasFreeSlot() or self.hottest() is not None
         if self.mode != Flg.FLG_SERVERLESS_WARM_WAIT:
             return True
         if self.hottest() is not None:
             return True
         if self.idleSetupInstance() is not None:
             return True
+        if not self.getScaler().hasFreeSlot():
+            return False
         return self.shouldColdStartRatherThanWait(queue_len=1)
     
     def roundRobin(self):
@@ -199,12 +324,31 @@ class Balancer:
         return instance
     
     def hottest(self):
+        if self._uses_hot_index():
+            heap = self._hot_heap
+            while heap:
+                neg_last, seq, _, instance = heap[0]
+                if (
+                    getattr(instance, "_bal_seq", None) == seq
+                    and instance.status == Status.ACTIVE
+                    and not instance.queue
+                    and instance.getLastTime() == -neg_last
+                ):
+                    return instance
+                heapq.heappop(heap)
+            return None
+        return self._hottest_scan()
+
+    def _hottest_scan(self):
+        # Most recently used idle ACTIVE instance; ties -> earliest in list.
+        # Staggered starters have last_time < 0, so no -1 sentinel cut-off
+        # (it used to make every starter except the first unreachable).
         hottest = None
-        last_time = -1
+        last_time = None
         for instance in self.getInstances():
             if instance.getStatus() == Status.ACTIVE and instance.getQueueLength() == 0:
                 temp_last = instance.getLastTime()
-                if last_time < temp_last:
+                if hottest is None or last_time < temp_last:
                     last_time = temp_last
                     hottest = instance
         return hottest
@@ -224,7 +368,7 @@ class Balancer:
         elif self.mode == Flg.FLG_SERVERLESS_WARM_WAIT:
             req.setProcessedBy("serverless_warm_wait" + str(instance.getId()))
         instance.addRequest(req)
-        self.last_instance = self.getInstances().index(instance)
+        self._last_instance_obj = instance
         return req
 
     def delRequest(self, req:Request):

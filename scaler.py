@@ -29,6 +29,11 @@ class Scaler:
         self.force_step_instances = set()
         self.hot_count = 0
         self._idle_heap = []  # (deadline_step, last_time, inst_id)
+        # Virtual setup/shutdown timers: one global pass counter plus a heap of
+        # (due_pass, token, id, oid, instance) instead of stepping every SETUP /
+        # SHUTDOWN instance on every executed step.
+        self.timer_passes = 0
+        self._timer_heap = []
         return
 
     def set_instance_factory(self, factory):
@@ -253,6 +258,7 @@ class Scaler:
     def note_serverless_last_time(self, instance, last_time):
         if not Flg.is_serverless(self.mode):
             return
+        self.getBalancer().note_hot_candidate(instance)
         if instance.getStatus() != Status.ACTIVE:
             return
         if self._instance_has_work(instance):
@@ -266,6 +272,8 @@ class Scaler:
     def refresh_instance_schedule(self, instance):
         """Reclassify instance into setup/shutdown/busy indexes and hot_count."""
         status = instance.getStatus()
+        if status == Status.ACTIVE:
+            self.getBalancer().note_hot_candidate(instance)
 
         if status == Status.SETUP:
             self.setup_instances.add(instance)
@@ -278,7 +286,10 @@ class Scaler:
             self.shutdown_instances.discard(instance)
 
         has_work = self._instance_has_work(instance)
-        if status in (Status.SETUP, Status.SHUTDOWN) or has_work or status == Status.WORKING:
+        if status in (Status.SETUP, Status.SHUTDOWN):
+            # Timer-driven: scheduled through the timer heap, not stepped.
+            self.busy_instances.discard(instance)
+        elif has_work or status == Status.WORKING:
             self.busy_instances.add(instance)
         else:
             self.busy_instances.discard(instance)
@@ -307,16 +318,62 @@ class Scaler:
             return
         self.refresh_instance_schedule(instance)
 
+    def _timer_due_pass(self, instance):
+        status = instance.getStatus()
+        anchor = instance._timer_anchor
+        if anchor is None:
+            return None
+        if status == Status.SETUP:
+            # Serverless flips at timer <= 0, Container at timer < 0.
+            if isinstance(instance, Serverless):
+                return anchor + instance._setuptimer
+            return anchor + instance._setuptimer + 1
+        if status == Status.SHUTDOWN:
+            return anchor + instance._deactivatetimer + 1
+        return None
+
+    def schedule_timer(self, instance):
+        due = self._timer_due_pass(instance)
+        if due is not None:
+            heapq.heappush(
+                self._timer_heap,
+                (due, instance._timer_token, int(instance.getId()), id(instance), instance),
+            )
+
+    def _timer_entry_valid(self, entry):
+        _due, token, _iid, _oid, instance = entry
+        if instance._timer_token != token or instance._timer_anchor is None:
+            return False
+        status = instance.getStatus()
+        if status == Status.SETUP:
+            return instance in self.setup_instances
+        if status == Status.SHUTDOWN:
+            return instance in self.shutdown_instances
+        return False
+
+    def min_timer_due(self):
+        heap = self._timer_heap
+        while heap:
+            if self._timer_entry_valid(heap[0]):
+                return heap[0][0]
+            heapq.heappop(heap)
+        return None
+
     def rebuild_schedule_indexes(self):
         self.setup_instances = set()
         self.shutdown_instances = set()
+        self._timer_heap = []
         self.busy_instances = set()
         self.force_step_instances = set()
         self.hot_count = 0
         self._idle_heap = []
         for instance in self.getRunnableInstances():
             instance._sched_hot = False
+            if instance.getStatus() in (Status.SETUP, Status.SHUTDOWN):
+                instance._materialize_timer()
             self.refresh_instance_schedule(instance)
+            if instance.getStatus() in (Status.SETUP, Status.SHUTDOWN):
+                instance._anchor_timer()
             # Heal checkpoints taken while a scaled-in instance was still
             # ACTIVE/WORKING with an armed deactivate timer.
             if (
@@ -327,11 +384,17 @@ class Scaler:
 
     def instances_needing_step(self, timestep):
         """Instances that must run this step (skip warm-idle ACTIVE)."""
-        due = set(self.setup_instances)
-        due.update(self.shutdown_instances)
-        due.update(self.busy_instances)
+        # One pass = the per-step decrement every SETUP/SHUTDOWN timer used to get.
+        self.timer_passes += 1
+        due = set(self.busy_instances)
         due.update(self.force_step_instances)
         self.force_step_instances.clear()
+        heap = self._timer_heap
+        passes = self.timer_passes
+        while heap and heap[0][0] <= passes:
+            entry = heapq.heappop(heap)
+            if self._timer_entry_valid(entry):
+                due.add(entry[4])
         # Deterministic, id-ascending order: same-step events (e.g. several
         # setups finishing together) register to the balancer lowest id first,
         # independent of object addresses.
@@ -354,18 +417,29 @@ class Scaler:
             return deadline
         return None
 
+    def needs_idle_flip(self, instance):
+        """Serverless WORKING instance with nothing left to run.
+
+        processRequests() flips it to ACTIVE on its next executed step; only
+        then can hottest() pick it. Per-step simulation runs that step right
+        away, so event-driven skipping must not jump past it (container
+        dispatch accepts WORKING instances, so it is unaffected).
+        """
+        if not Flg.is_serverless(self.mode):
+            return False
+        if instance.getStatus() != Status.WORKING or instance.queue:
+            return False
+        for slot in instance.exec_queue:
+            if slot is not None:
+                return False
+        return True
+
     def has_transition_or_busy_immediate(self, step):
         if self.force_step_instances:
             return True
-        for instance in self.setup_instances:
-            if isinstance(instance, Serverless):
-                if instance.setuptimer <= 1:
-                    return True
-            elif instance.setuptimer <= 0:
-                return True
-        for instance in self.shutdown_instances:
-            if instance.deactivatetimer <= 0:
-                return True
+        due = self.min_timer_due()
+        if due is not None and due <= self.timer_passes + 1:
+            return True
         for instance in self.busy_instances:
             status = instance.getStatus()
             if status in (Status.SETUP, Status.SHUTDOWN):
@@ -377,18 +451,17 @@ class Scaler:
             for req in exec_queue:
                 if req is not None and req.workload <= 0:
                     return True
+            if self.needs_idle_flip(instance):
+                return True
         idle_due = self.next_serverless_idle_step(step, defer_idle=False)
         return idle_due is not None and idle_due <= step
 
     def collect_next_event_candidates(self, step, defer_idle=False):
         candidates = []
-        for instance in self.setup_instances:
-            if isinstance(instance, Serverless):
-                candidates.append(step + max(1, instance.setuptimer - 1))
-            else:
-                candidates.append(step + max(1, instance.setuptimer))
-        for instance in self.shutdown_instances:
-            candidates.append(step + max(1, instance.deactivatetimer))
+        due = self.min_timer_due()
+        if due is not None:
+            # The step whose pass reaches `due` (passes advance one per step).
+            candidates.append(step + max(1, due - self.timer_passes - 1))
         for instance in self.busy_instances:
             status = instance.getStatus()
             if status in (Status.SETUP, Status.SHUTDOWN):
@@ -413,17 +486,10 @@ class Scaler:
     def advance_indexed_busy_work(self, step, skip_steps):
         if skip_steps <= 0:
             return
-        touched = set(self.setup_instances)
-        touched.update(self.shutdown_instances)
-        touched.update(self.busy_instances)
-        for instance in tuple(touched):
+        # SETUP/SHUTDOWN timers advance with the global pass counter.
+        self.timer_passes += skip_steps
+        for instance in tuple(self.busy_instances):
             status = instance.getStatus()
-            if status == Status.SETUP:
-                instance.setuptimer -= skip_steps
-                continue
-            if status == Status.SHUTDOWN:
-                instance.deactivatetimer -= skip_steps
-                continue
             if status not in (Status.ACTIVE, Status.WORKING):
                 continue
             busy_slots = 0
@@ -470,6 +536,10 @@ class Scaler:
                 instance.activateInstance(self)
                 num_active_instance += 1
         return
+
+    def hasFreeSlot(self):
+        """True if coldStartInstance() could materialize a new instance now."""
+        return bool(self._free_set)
 
     def coldStartInstance(self):
         # Equivalent to "first INACTIVE in ascending id order".

@@ -25,7 +25,8 @@ class Serverless(Instance):
         return
     
     def setupInstance(self):
-        self.setuptimer -= 1
+        if not self.timer_virtual():
+            self.setuptimer -= 1
         if self.setuptimer <= 0:
             self.setStatus(Status.ACTIVE)
             # print("COMPLETE SCALE OUT: " + str(self.getId()))

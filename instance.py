@@ -7,8 +7,14 @@ class Instance:
     def __init__(self, capacity, num_CPU, queue_length, status, config:Config):
         self.config = config
         self.id = -1
-        self.setuptimer = -1
-        self.deactivatetimer = -1
+        # Raw timer values. While the instance is in SETUP (setuptimer) or
+        # SHUTDOWN (deactivatetimer) under a scaler, the timer is "virtual":
+        # it counts down with the scaler's global pass counter instead of being
+        # decremented on every step (see Scaler.timer_passes).
+        self._setuptimer = -1
+        self._deactivatetimer = -1
+        self._timer_anchor = None
+        self._timer_token = 0
         self.status = status
         self.status_manager = None
         self.processing_capacity = capacity / self.config.SIM_STEP_PER_TIME
@@ -64,9 +70,76 @@ class Instance:
         self.queue.popleft()
         return
     
+
+    # --- Virtual setup/shutdown timers -------------------------------------
+    def _timer_passes(self):
+        sm = self.status_manager
+        return None if sm is None else getattr(sm, "timer_passes", None)
+
+    def _timer_elapsed(self):
+        anchor = self._timer_anchor
+        if anchor is None:
+            return 0
+        passes = self._timer_passes()
+        return 0 if passes is None else passes - anchor
+
+    @property
+    def setuptimer(self):
+        if getattr(self, "status", None) == Status.SETUP and self._timer_anchor is not None:
+            return self._setuptimer - self._timer_elapsed()
+        return self._setuptimer
+
+    @setuptimer.setter
+    def setuptimer(self, value):
+        self._setuptimer = value
+        if getattr(self, "status", None) == Status.SETUP and self._timer_anchor is not None:
+            self._anchor_timer()
+
+    @property
+    def deactivatetimer(self):
+        if getattr(self, "status", None) == Status.SHUTDOWN and self._timer_anchor is not None:
+            return self._deactivatetimer - self._timer_elapsed()
+        return self._deactivatetimer
+
+    @deactivatetimer.setter
+    def deactivatetimer(self, value):
+        self._deactivatetimer = value
+        if getattr(self, "status", None) == Status.SHUTDOWN and self._timer_anchor is not None:
+            self._anchor_timer()
+
+    def _materialize_timer(self):
+        """Fold elapsed passes into the raw value of the running timer."""
+        if self._timer_anchor is None:
+            return
+        elapsed = self._timer_elapsed()
+        if self.status == Status.SETUP:
+            self._setuptimer -= elapsed
+        elif self.status == Status.SHUTDOWN:
+            self._deactivatetimer -= elapsed
+        self._timer_anchor = None
+
+    def _anchor_timer(self):
+        """Start (or restart) the virtual countdown at the current pass."""
+        passes = self._timer_passes()
+        if passes is None:
+            self._timer_anchor = None
+            return
+        self._timer_anchor = passes
+        self._timer_token += 1
+        sm = self.status_manager
+        if sm is not None and hasattr(sm, "schedule_timer"):
+            sm.schedule_timer(self)
+
+    def timer_virtual(self):
+        return self._timer_anchor is not None
+
     def setStatus(self, status):
         prev_status = self.status
+        if prev_status != status and prev_status in (Status.SETUP, Status.SHUTDOWN):
+            self._materialize_timer()
         self.status = status
+        if prev_status != status and status in (Status.SETUP, Status.SHUTDOWN):
+            self._anchor_timer()
         status_manager = self.status_manager
         if status_manager is not None and prev_status != status:
             if prev_status == Status.INACTIVE and status != Status.INACTIVE:
@@ -161,7 +234,8 @@ class Instance:
         return
     
     def shutdownInstance(self):
-        self.deactivatetimer -= 1
+        if not self.timer_virtual():
+            self.deactivatetimer -= 1
         if self.deactivatetimer < 0:
             self.setStatus(Status.INACTIVE)
             self.setCpuCtr(0)

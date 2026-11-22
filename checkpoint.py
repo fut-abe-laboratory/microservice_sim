@@ -259,6 +259,8 @@ def apply_state(sim, state: dict) -> int:
     balancer.last_instance = bal["last_instance"]
     balancer.instances = [by_id[int(i)] for i in bal["instance_ids"]]
     balancer.requests = [_resolve_request(found, snap) for snap in bal["requests"]]
+    if hasattr(balancer, "rebuild_hot_index"):
+        balancer.rebuild_hot_index()
 
     scaler.num_active_instance = sc["num_active_instance"]
     scaler.runnable_instances = [by_id[int(i)] for i in sc["runnable_ids"]]
